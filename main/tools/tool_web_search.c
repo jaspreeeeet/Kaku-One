@@ -158,7 +158,7 @@ static void format_results(cJSON *root, char *output, size_t output_size)
 
 /* ── Direct HTTPS request ─────────────────────────────────────── */
 
-static esp_err_t search_direct(const char *url, search_buf_t *sb)
+static esp_err_t brave_search_direct(const char *url, search_buf_t *sb)
 {
     esp_http_client_config_t config = {
         .url = url,
@@ -173,7 +173,7 @@ static esp_err_t search_direct(const char *url, search_buf_t *sb)
     if (!client) return ESP_FAIL;
 
     esp_http_client_set_header(client, "Accept", "application/json");
-    esp_http_client_set_header(client, "X-Subscription-Token", s_search_key);
+    esp_http_client_set_header(client, "X-Subscription-Token", s_brave_key);
 
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
@@ -189,7 +189,7 @@ static esp_err_t search_direct(const char *url, search_buf_t *sb)
 
 /* ── Proxy HTTPS request ──────────────────────────────────────── */
 
-static esp_err_t search_via_proxy(const char *path, search_buf_t *sb)
+static esp_err_t brave_search_via_proxy(const char *path, search_buf_t *sb)
 {
     proxy_conn_t *conn = proxy_conn_open("api.search.brave.com", 443, 15000);
     if (!conn) return ESP_ERR_HTTP_CONNECT;
@@ -201,7 +201,7 @@ static esp_err_t search_via_proxy(const char *path, search_buf_t *sb)
         "Accept: application/json\r\n"
         "X-Subscription-Token: %s\r\n"
         "Connection: close\r\n\r\n",
-        path, s_search_key);
+        path, s_brave_key);
 
     if (proxy_conn_write(conn, header, hlen) < 0) {
         proxy_conn_close(conn);
