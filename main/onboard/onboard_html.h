@@ -31,6 +31,9 @@ static const char ONBOARD_HTML[] =
 ".status{text-align:center;padding:20px;color:#1a73e8;font-size:1.1em;display:none}"
 "</style></head><body>"
 "<h1>MimiClaw Setup</h1>"
+"<p style='text-align:center;color:#666;font-size:.9em;margin-bottom:12px'>"
+"This local portal remains available at 192.168.4.1 for later updates."
+"</p>"
 
 /* WiFi section (expanded by default) */
 "<div class='card' id='sec-wifi'>"
@@ -110,6 +113,14 @@ static const char ONBOARD_HTML[] =
 "function toggle(el){"
 "el.parentElement.classList.toggle('collapsed')}"
 
+"function loadConfig(){"
+"fetch('/config').then(r=>r.json()).then(cfg=>{"
+"Object.keys(cfg).forEach(k=>{"
+"var el=document.getElementById(k);"
+"if(el && cfg[k] !== undefined && cfg[k] !== null){el.value=cfg[k]}"
+"})"
+"}).catch(()=>{})}"
+
 "function scan(){"
 "var btn=event.target;btn.textContent='Scanning...';btn.disabled=true;"
 "fetch('/scan').then(r=>r.json()).then(list=>{"
@@ -126,11 +137,11 @@ static const char ONBOARD_HTML[] =
 "var fields=['ssid','password','api_key','model','provider','tg_token',"
 "'feishu_app_id','feishu_app_secret','proxy_host','proxy_port','proxy_type','search_key','tavily_key'];"
 "var data={};"
-"fields.forEach(f=>{var v=document.getElementById(f).value.trim();if(v)data[f]=v});"
-"if(!data.ssid){alert('WiFi SSID is required');return}"
+"fields.forEach(f=>{data[f]=document.getElementById(f).value.trim()});"
 "document.getElementById('status').style.display='block';"
 "fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})"
 ".then(()=>{document.getElementById('status').textContent='Saved! Restarting...';})"
 ".catch(()=>{document.getElementById('status').textContent='Error. Please try again.';})}"
+"loadConfig();"
 "</script>"
 "</body></html>";

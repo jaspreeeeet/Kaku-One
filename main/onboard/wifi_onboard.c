@@ -3,6 +3,8 @@
 #include "mimi_config.h"
 #include "wifi/wifi_manager.h"
 
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -18,6 +20,55 @@
 #include "lwip/netdb.h"
 
 static const char *TAG = "onboard";
+static httpd_handle_t s_server = NULL;
+static bool s_captive_mode = false;
+
+static void json_add_effective_config(cJSON *root, const char *json_key,
+                                      const char *ns, const char *nvs_key,
+                                      const char *build_val)
+{
+    char value[256] = {0};
+    bool found = false;
+
+    nvs_handle_t nvs;
+    if (nvs_open(ns, NVS_READONLY, &nvs) == ESP_OK) {
+        size_t len = sizeof(value);
+        if (nvs_get_str(nvs, nvs_key, value, &len) == ESP_OK) {
+            found = true;
+        }
+        nvs_close(nvs);
+    }
+
+    if (!found && build_val) {
+        strlcpy(value, build_val, sizeof(value));
+    }
+
+    cJSON_AddStringToObject(root, json_key, value);
+}
+
+static void json_add_effective_config_u16(cJSON *root, const char *json_key,
+                                          const char *ns, const char *nvs_key,
+                                          const char *build_val)
+{
+    char value[16] = {0};
+    bool found = false;
+
+    nvs_handle_t nvs;
+    if (nvs_open(ns, NVS_READONLY, &nvs) == ESP_OK) {
+        uint16_t port = 0;
+        if (nvs_get_u16(nvs, nvs_key, &port) == ESP_OK && port > 0) {
+            snprintf(value, sizeof(value), "%u", (unsigned)port);
+            found = true;
+        }
+        nvs_close(nvs);
+    }
+
+    if (!found && build_val) {
+        strlcpy(value, build_val, sizeof(value));
+    }
+
+    cJSON_AddStringToObject(root, json_key, value);
+}
 
 /* ── DNS hijack ─────────────────────────────────────────────────── */
 
@@ -156,19 +207,99 @@ static esp_err_t http_get_scan(httpd_req_t *req)
     return ret;
 }
 
-/* Helper: save a single NVS string if json field is present and non-empty */
-static void nvs_save_field(cJSON *root, const char *json_key,
+static esp_err_t http_get_config(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    json_add_effective_config(root, "ssid", MIMI_NVS_WIFI, MIMI_NVS_KEY_SSID, MIMI_SECRET_WIFI_SSID);
+    json_add_effective_config(root, "password", MIMI_NVS_WIFI, MIMI_NVS_KEY_PASS, MIMI_SECRET_WIFI_PASS);
+    json_add_effective_config(root, "api_key", MIMI_NVS_LLM, MIMI_NVS_KEY_API_KEY, MIMI_SECRET_API_KEY);
+    json_add_effective_config(root, "model", MIMI_NVS_LLM, MIMI_NVS_KEY_MODEL, MIMI_SECRET_MODEL);
+    json_add_effective_config(root, "provider", MIMI_NVS_LLM, MIMI_NVS_KEY_PROVIDER, MIMI_SECRET_MODEL_PROVIDER);
+    json_add_effective_config(root, "tg_token", MIMI_NVS_TG, MIMI_NVS_KEY_TG_TOKEN, MIMI_SECRET_TG_TOKEN);
+    json_add_effective_config(root, "feishu_app_id", MIMI_NVS_FEISHU, MIMI_NVS_KEY_FEISHU_APP_ID, MIMI_SECRET_FEISHU_APP_ID);
+    json_add_effective_config(root, "feishu_app_secret", MIMI_NVS_FEISHU, MIMI_NVS_KEY_FEISHU_APP_SECRET, MIMI_SECRET_FEISHU_APP_SECRET);
+    json_add_effective_config(root, "proxy_host", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_HOST, MIMI_SECRET_PROXY_HOST);
+    json_add_effective_config_u16(root, "proxy_port", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_PORT, MIMI_SECRET_PROXY_PORT);
+    json_add_effective_config(root, "proxy_type", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_TYPE, MIMI_SECRET_PROXY_TYPE);
+    json_add_effective_config(root, "search_key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_API_KEY, MIMI_SECRET_SEARCH_KEY);
+    json_add_effective_config(root, "tavily_key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_TAVILY_KEY, MIMI_SECRET_TAVILY_KEY);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    esp_err_t ret = httpd_resp_send(req, json, strlen(json));
+    free(json);
+    return ret;
+}
+
+/*
+ * Sync one JSON string field into NVS.
+ * - missing field: leave current NVS value unchanged
+ * - empty string: erase current NVS value
+ * - non-empty string: save/update current NVS value
+ */
+static void nvs_sync_field(cJSON *root, const char *json_key,
                            const char *ns, const char *nvs_key)
 {
     cJSON *item = cJSON_GetObjectItem(root, json_key);
-    if (!item || !cJSON_IsString(item) || item->valuestring[0] == '\0') return;
+    if (!item || !cJSON_IsString(item)) return;
 
     nvs_handle_t nvs;
     if (nvs_open(ns, NVS_READWRITE, &nvs) == ESP_OK) {
-        nvs_set_str(nvs, nvs_key, item->valuestring);
+        if (item->valuestring[0] == '\0') {
+            esp_err_t err = nvs_erase_key(nvs, nvs_key);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Cleared %s/%s", ns, nvs_key);
+            } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+                ESP_LOGW(TAG, "Failed clearing %s/%s: %s", ns, nvs_key, esp_err_to_name(err));
+            }
+        } else {
+            nvs_set_str(nvs, nvs_key, item->valuestring);
+            ESP_LOGI(TAG, "Saved %s/%s", ns, nvs_key);
+        }
         nvs_commit(nvs);
         nvs_close(nvs);
-        ESP_LOGI(TAG, "Saved %s/%s", ns, nvs_key);
+    }
+}
+
+static void nvs_sync_u16_field(cJSON *root, const char *json_key,
+                               const char *ns, const char *nvs_key)
+{
+    cJSON *item = cJSON_GetObjectItem(root, json_key);
+    if (!item || !cJSON_IsString(item)) return;
+
+    nvs_handle_t nvs;
+    if (nvs_open(ns, NVS_READWRITE, &nvs) == ESP_OK) {
+        if (item->valuestring[0] == '\0') {
+            esp_err_t err = nvs_erase_key(nvs, nvs_key);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Cleared %s/%s", ns, nvs_key);
+            } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+                ESP_LOGW(TAG, "Failed clearing %s/%s: %s", ns, nvs_key, esp_err_to_name(err));
+            }
+        } else {
+            char *end = NULL;
+            unsigned long value = strtoul(item->valuestring, &end, 10);
+            if (end == item->valuestring || *end != '\0' || value > UINT16_MAX) {
+                ESP_LOGW(TAG, "Ignoring invalid %s value: %s", json_key, item->valuestring);
+            } else {
+                ESP_ERROR_CHECK(nvs_set_u16(nvs, nvs_key, (uint16_t)value));
+                ESP_LOGI(TAG, "Saved %s/%s", ns, nvs_key);
+            }
+        }
+        nvs_commit(nvs);
+        nvs_close(nvs);
     }
 }
 
@@ -205,29 +336,29 @@ static esp_err_t http_post_save(httpd_req_t *req)
     }
 
     /* WiFi (required) */
-    nvs_save_field(root, "ssid",     MIMI_NVS_WIFI,   MIMI_NVS_KEY_SSID);
-    nvs_save_field(root, "password", MIMI_NVS_WIFI,   MIMI_NVS_KEY_PASS);
+    nvs_sync_field(root, "ssid",     MIMI_NVS_WIFI,   MIMI_NVS_KEY_SSID);
+    nvs_sync_field(root, "password", MIMI_NVS_WIFI,   MIMI_NVS_KEY_PASS);
 
     /* LLM */
-    nvs_save_field(root, "api_key",  MIMI_NVS_LLM,    MIMI_NVS_KEY_API_KEY);
-    nvs_save_field(root, "model",    MIMI_NVS_LLM,    MIMI_NVS_KEY_MODEL);
-    nvs_save_field(root, "provider", MIMI_NVS_LLM,    MIMI_NVS_KEY_PROVIDER);
+    nvs_sync_field(root, "api_key",  MIMI_NVS_LLM,    MIMI_NVS_KEY_API_KEY);
+    nvs_sync_field(root, "model",    MIMI_NVS_LLM,    MIMI_NVS_KEY_MODEL);
+    nvs_sync_field(root, "provider", MIMI_NVS_LLM,    MIMI_NVS_KEY_PROVIDER);
 
     /* Telegram */
-    nvs_save_field(root, "tg_token", MIMI_NVS_TG,     MIMI_NVS_KEY_TG_TOKEN);
+    nvs_sync_field(root, "tg_token", MIMI_NVS_TG,     MIMI_NVS_KEY_TG_TOKEN);
 
     /* Feishu */
-    nvs_save_field(root, "feishu_app_id",     MIMI_NVS_FEISHU, MIMI_NVS_KEY_FEISHU_APP_ID);
-    nvs_save_field(root, "feishu_app_secret", MIMI_NVS_FEISHU, MIMI_NVS_KEY_FEISHU_APP_SECRET);
+    nvs_sync_field(root, "feishu_app_id",     MIMI_NVS_FEISHU, MIMI_NVS_KEY_FEISHU_APP_ID);
+    nvs_sync_field(root, "feishu_app_secret", MIMI_NVS_FEISHU, MIMI_NVS_KEY_FEISHU_APP_SECRET);
 
     /* Proxy */
-    nvs_save_field(root, "proxy_host", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_HOST);
-    nvs_save_field(root, "proxy_port", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_PORT);
-    nvs_save_field(root, "proxy_type", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_TYPE);
+    nvs_sync_field(root, "proxy_host", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_HOST);
+    nvs_sync_u16_field(root, "proxy_port", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_PORT);
+    nvs_sync_field(root, "proxy_type", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_TYPE);
 
     /* Search */
-    nvs_save_field(root, "search_key", MIMI_NVS_SEARCH, "brave_key");
-    nvs_save_field(root, "tavily_key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_TAVILY_KEY);
+    nvs_sync_field(root, "search_key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_API_KEY);
+    nvs_sync_field(root, "tavily_key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_TAVILY_KEY);
 
     cJSON_Delete(root);
 
@@ -243,7 +374,7 @@ static esp_err_t http_post_save(httpd_req_t *req)
 
 /* ── Soft AP + HTTP server startup ──────────────────────────────── */
 
-static esp_err_t start_softap(void)
+static esp_err_t start_softap(bool keep_sta)
 {
     /* Get last 2 bytes of MAC for unique SSID suffix */
     uint8_t mac[6];
@@ -257,7 +388,8 @@ static esp_err_t start_softap(void)
         ap_netif = esp_netif_create_default_wifi_ap();
     }
 
-    /* Switch to APSTA so we can scan while serving */
+    /* APSTA lets the local config AP coexist with WiFi scanning/STA usage. */
+    (void)keep_sta;
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
 
     wifi_config_t ap_cfg = {
@@ -271,22 +403,31 @@ static esp_err_t start_softap(void)
     ap_cfg.ap.ssid_len = strlen(ssid);
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_err_t err = esp_wifi_start();
+    if (err != ESP_OK && !(keep_sta && err == ESP_ERR_WIFI_CONN)) {
+        return err;
+    }
 
     ESP_LOGI(TAG, "Soft AP started: %s (open)", ssid);
     return ESP_OK;
 }
 
-static httpd_handle_t start_http_server(void)
+static httpd_handle_t start_http_server(bool captive)
 {
+    if (s_server) {
+        if (captive && !s_captive_mode) {
+            ESP_LOGW(TAG, "HTTP server already running without captive redirects");
+        }
+        return s_server;
+    }
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = MIMI_ONBOARD_HTTP_PORT;
-    config.max_uri_handlers = 10;
+    config.max_uri_handlers = captive ? 16 : 8;
     config.stack_size = 8192;
     config.lru_purge_enable = true;
 
-    httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) != ESP_OK) {
+    if (httpd_start(&s_server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start HTTP server");
         return NULL;
     }
@@ -295,66 +436,85 @@ static httpd_handle_t start_http_server(void)
     httpd_uri_t uri_root = {
         .uri = "/", .method = HTTP_GET, .handler = http_get_root,
     };
-    httpd_register_uri_handler(server, &uri_root);
+    httpd_register_uri_handler(s_server, &uri_root);
+
+    httpd_uri_t uri_config = {
+        .uri = "/config", .method = HTTP_GET, .handler = http_get_config,
+    };
+    httpd_register_uri_handler(s_server, &uri_config);
 
     /* WiFi scan */
     httpd_uri_t uri_scan = {
         .uri = "/scan", .method = HTTP_GET, .handler = http_get_scan,
     };
-    httpd_register_uri_handler(server, &uri_scan);
+    httpd_register_uri_handler(s_server, &uri_scan);
 
     /* Save config */
     httpd_uri_t uri_save = {
         .uri = "/save", .method = HTTP_POST, .handler = http_post_save,
     };
-    httpd_register_uri_handler(server, &uri_save);
+    httpd_register_uri_handler(s_server, &uri_save);
 
-    /* Captive portal detection endpoints */
-    const char *captive_uris[] = {
-        "/generate_204",           /* Android */
-        "/gen_204",                /* Android alt */
-        "/hotspot-detect.html",    /* iOS/macOS */
-        "/library/test/success.html", /* iOS alt */
-        "/connecttest.txt",        /* Windows */
-        "/redirect",               /* Windows alt */
-    };
-    for (int i = 0; i < sizeof(captive_uris) / sizeof(captive_uris[0]); i++) {
-        httpd_uri_t uri_captive = {
-            .uri = captive_uris[i],
-            .method = HTTP_GET,
-            .handler = http_captive_redirect,
+    if (captive) {
+        /* Captive portal detection endpoints */
+        const char *captive_uris[] = {
+            "/generate_204",           /* Android */
+            "/gen_204",                /* Android alt */
+            "/hotspot-detect.html",    /* iOS/macOS */
+            "/library/test/success.html", /* iOS alt */
+            "/connecttest.txt",        /* Windows */
+            "/redirect",               /* Windows alt */
         };
-        httpd_register_uri_handler(server, &uri_captive);
+        for (int i = 0; i < sizeof(captive_uris) / sizeof(captive_uris[0]); i++) {
+            httpd_uri_t uri_captive = {
+                .uri = captive_uris[i],
+                .method = HTTP_GET,
+                .handler = http_captive_redirect,
+            };
+            httpd_register_uri_handler(s_server, &uri_captive);
+        }
     }
 
+    s_captive_mode = captive;
     ESP_LOGI(TAG, "HTTP server started on port %d", MIMI_ONBOARD_HTTP_PORT);
-    return server;
+    return s_server;
 }
 
 /* ── Public API ─────────────────────────────────────────────────── */
 
-esp_err_t wifi_onboard_start(void)
+esp_err_t wifi_onboard_start(wifi_onboard_mode_t mode)
 {
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  Starting WiFi Onboarding Portal");
+    ESP_LOGI(TAG, "  Starting WiFi Configuration Portal");
     ESP_LOGI(TAG, "========================================");
 
-    /* Stop STA if it was running */
-    wifi_manager_stop();
+    bool captive = (mode == WIFI_ONBOARD_MODE_CAPTIVE);
+    if (captive) {
+        /* Stop STA retries before starting captive portal. */
+        wifi_manager_set_reconnect_enabled(false);
+        wifi_manager_stop();
+    }
 
     /* Start soft AP */
-    esp_err_t err = start_softap();
+    esp_err_t err = start_softap(!captive);
     if (err != ESP_OK) return err;
 
-    /* Start DNS hijack task */
-    xTaskCreate(dns_hijack_task, "dns_hijack",
-                MIMI_ONBOARD_DNS_STACK, NULL, 5, NULL);
+    if (captive) {
+        /* Start DNS hijack only for true captive portal mode. */
+        xTaskCreate(dns_hijack_task, "dns_hijack",
+                    MIMI_ONBOARD_DNS_STACK, NULL, 5, NULL);
+    }
 
     /* Start HTTP server */
-    httpd_handle_t server = start_http_server();
+    httpd_handle_t server = start_http_server(captive);
     if (!server) return ESP_FAIL;
 
     ESP_LOGI(TAG, "Connect to MimiClaw-XXXX WiFi, then open http://192.168.4.1");
+
+    if (!captive) {
+        ESP_LOGI(TAG, "Local admin portal stays available while STA is connected");
+        return ESP_OK;
+    }
 
     /* Block forever — onboarding ends with esp_restart() in /save handler */
     while (1) {
