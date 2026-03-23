@@ -187,19 +187,38 @@ static bool provider_is_openai(void)
     return strcmp(s_provider, "openai") == 0;
 }
 
-static const char *llm_api_url(void)
+static bool provider_is_gemini(void)
 {
-    return provider_is_openai() ? MIMI_OPENAI_API_URL : MIMI_LLM_API_URL;
+    return strcmp(s_provider, "gemini") == 0;
+}
+
+static void llm_build_api_url(char *buf, size_t buf_size)
+{
+    if (provider_is_openai()) {
+        snprintf(buf, buf_size, "%s", MIMI_OPENAI_API_URL);
+    } else if (provider_is_gemini()) {
+        snprintf(buf, buf_size, MIMI_GEMINI_API_URL_FMT, s_model);
+    } else {
+        snprintf(buf, buf_size, "%s", MIMI_LLM_API_URL);
+    }
 }
 
 static const char *llm_api_host(void)
 {
-    return provider_is_openai() ? "api.openai.com" : "api.anthropic.com";
+    if (provider_is_openai()) return "api.openai.com";
+    if (provider_is_gemini()) return "generativelanguage.googleapis.com";
+    return "api.anthropic.com";
 }
 
-static const char *llm_api_path(void)
+static void llm_build_api_path(char *buf, size_t buf_size)
 {
-    return provider_is_openai() ? "/v1/chat/completions" : "/v1/messages";
+    if (provider_is_openai()) {
+        snprintf(buf, buf_size, "/v1/chat/completions");
+    } else if (provider_is_gemini()) {
+        snprintf(buf, buf_size, "/v1beta/models/%s:generateContent", s_model);
+    } else {
+        snprintf(buf, buf_size, "/v1/messages");
+    }
 }
 
 /* ── Init ─────────────────────────────────────────────────────── */
@@ -238,6 +257,11 @@ esp_err_t llm_proxy_init(void)
         nvs_close(nvs);
     }
 
+    if (provider_is_gemini() &&
+        (s_model[0] == '\0' || strcmp(s_model, MIMI_LLM_DEFAULT_MODEL) == 0)) {
+        safe_copy(s_model, sizeof(s_model), MIMI_GEMINI_DEFAULT_MODEL);
+    }
+
     if (s_api_key[0]) {
         ESP_LOGI(TAG, "LLM proxy initialized (provider: %s, model: %s)", s_provider, s_model);
     } else {
@@ -250,8 +274,11 @@ esp_err_t llm_proxy_init(void)
 
 static esp_err_t llm_http_direct(const char *post_data, resp_buf_t *rb, int *out_status)
 {
+    char url[192];
+    llm_build_api_url(url, sizeof(url));
+
     esp_http_client_config_t config = {
-        .url = llm_api_url(),
+        .url = url,
         .event_handler = http_event_handler,
         .user_data = rb,
         .timeout_ms = 120 * 1000,
@@ -271,6 +298,8 @@ static esp_err_t llm_http_direct(const char *post_data, resp_buf_t *rb, int *out
             snprintf(auth, sizeof(auth), "Bearer %s", s_api_key);
             esp_http_client_set_header(client, "Authorization", auth);
         }
+    } else if (provider_is_gemini()) {
+        esp_http_client_set_header(client, "x-goog-api-key", s_api_key);
     } else {
         esp_http_client_set_header(client, "x-api-key", s_api_key);
         esp_http_client_set_header(client, "anthropic-version", MIMI_LLM_API_VERSION);
@@ -292,6 +321,8 @@ static esp_err_t llm_http_via_proxy(const char *post_data, resp_buf_t *rb, int *
 
     int body_len = strlen(post_data);
     char header[1024];
+    char path[128];
+    llm_build_api_path(path, sizeof(path));
     int hlen = 0;
     if (provider_is_openai()) {
         hlen = snprintf(header, sizeof(header),
@@ -301,7 +332,16 @@ static esp_err_t llm_http_via_proxy(const char *post_data, resp_buf_t *rb, int *
             "Authorization: Bearer %s\r\n"
             "Content-Length: %d\r\n"
             "Connection: close\r\n\r\n",
-            llm_api_path(), llm_api_host(), s_api_key, body_len);
+            path, llm_api_host(), s_api_key, body_len);
+    } else if (provider_is_gemini()) {
+        hlen = snprintf(header, sizeof(header),
+            "POST %s HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Content-Type: application/json\r\n"
+            "x-goog-api-key: %s\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n",
+            path, llm_api_host(), s_api_key, body_len);
     } else {
         hlen = snprintf(header, sizeof(header),
             "POST %s HTTP/1.1\r\n"
@@ -311,7 +351,7 @@ static esp_err_t llm_http_via_proxy(const char *post_data, resp_buf_t *rb, int *
             "anthropic-version: %s\r\n"
             "Content-Length: %d\r\n"
             "Connection: close\r\n\r\n",
-            llm_api_path(), llm_api_host(), s_api_key, MIMI_LLM_API_VERSION, body_len);
+            path, llm_api_host(), s_api_key, MIMI_LLM_API_VERSION, body_len);
     }
 
     if (proxy_conn_write(conn, header, hlen) < 0 ||
@@ -532,6 +572,78 @@ static cJSON *convert_messages_openai(const char *system_prompt, cJSON *messages
     return out;
 }
 
+static cJSON *convert_messages_gemini(cJSON *messages)
+{
+    cJSON *out = cJSON_CreateArray();
+    if (!messages || !cJSON_IsArray(messages)) return out;
+
+    cJSON *msg;
+    cJSON_ArrayForEach(msg, messages) {
+        cJSON *role = cJSON_GetObjectItem(msg, "role");
+        cJSON *content = cJSON_GetObjectItem(msg, "content");
+        if (!role || !cJSON_IsString(role)) continue;
+
+        const char *gem_role = (strcmp(role->valuestring, "assistant") == 0) ? "model" : "user";
+        char *text_buf = NULL;
+        size_t off = 0;
+
+        if (content && cJSON_IsString(content)) {
+            text_buf = strdup(content->valuestring);
+            off = text_buf ? strlen(text_buf) : 0;
+        } else if (content && cJSON_IsArray(content)) {
+            cJSON *block;
+            cJSON_ArrayForEach(block, content) {
+                cJSON *btype = cJSON_GetObjectItem(block, "type");
+                if (!btype || !cJSON_IsString(btype)) continue;
+
+                const char *append_text = NULL;
+                char *tmp_owned = NULL;
+                if (strcmp(btype->valuestring, "text") == 0) {
+                    cJSON *text = cJSON_GetObjectItem(block, "text");
+                    if (text && cJSON_IsString(text)) {
+                        append_text = text->valuestring;
+                    }
+                } else if (strcmp(btype->valuestring, "tool_result") == 0) {
+                    cJSON *tool_content = cJSON_GetObjectItem(block, "content");
+                    if (tool_content && cJSON_IsString(tool_content)) {
+                        tmp_owned = cJSON_PrintUnformatted(tool_content);
+                        append_text = tmp_owned;
+                    }
+                }
+
+                if (append_text && append_text[0]) {
+                    size_t tlen = strlen(append_text);
+                    char *tmp = realloc(text_buf, off + tlen + 2);
+                    if (tmp) {
+                        text_buf = tmp;
+                        if (off > 0) {
+                            text_buf[off++] = '\n';
+                        }
+                        memcpy(text_buf + off, append_text, tlen);
+                        off += tlen;
+                        text_buf[off] = '\0';
+                    }
+                }
+                free(tmp_owned);
+            }
+        }
+
+        if (text_buf && text_buf[0]) {
+            cJSON *entry = cJSON_CreateObject();
+            cJSON_AddStringToObject(entry, "role", gem_role);
+            cJSON *parts = cJSON_CreateArray();
+            cJSON *part = cJSON_CreateObject();
+            cJSON_AddStringToObject(part, "text", text_buf);
+            cJSON_AddItemToArray(parts, part);
+            cJSON_AddItemToObject(entry, "parts", parts);
+            cJSON_AddItemToArray(out, entry);
+        }
+        free(text_buf);
+    }
+
+    return out;
+}
+
 /* ── Public: chat with tools (non-streaming) ──────────────────── */
 
 void llm_response_free(llm_response_t *resp)
@@ -558,9 +670,15 @@ esp_err_t llm_chat_tools(const char *system_prompt,
 
     /* Build request body (non-streaming) */
     cJSON *body = cJSON_CreateObject();
-    cJSON_AddStringToObject(body, "model", s_model);
+    if (!provider_is_gemini()) {
+        cJSON_AddStringToObject(body, "model", s_model);
+    }
     if (provider_is_openai()) {
         cJSON_AddNumberToObject(body, "max_completion_tokens", MIMI_LLM_MAX_TOKENS);
+    } else if (provider_is_gemini()) {
+        cJSON *gen = cJSON_CreateObject();
+        cJSON_AddNumberToObject(gen, "maxOutputTokens", MIMI_LLM_MAX_TOKENS);
+        cJSON_AddItemToObject(body, "generationConfig", gen);
     } else {
         cJSON_AddNumberToObject(body, "max_tokens", MIMI_LLM_MAX_TOKENS);
     }
@@ -576,6 +694,18 @@ esp_err_t llm_chat_tools(const char *system_prompt,
                 cJSON_AddStringToObject(body, "tool_choice", "auto");
             }
         }
+    } else if (provider_is_gemini()) {
+        if (system_prompt && system_prompt[0]) {
+            cJSON *sys = cJSON_CreateObject();
+            cJSON *parts = cJSON_CreateArray();
+            cJSON *part = cJSON_CreateObject();
+            cJSON_AddStringToObject(part, "text", system_prompt);
+            cJSON_AddItemToArray(parts, part);
+            cJSON_AddItemToObject(sys, "parts", parts);
+            cJSON_AddItemToObject(body, "systemInstruction", sys);
+        }
+        cJSON *gemini_msgs = convert_messages_gemini(messages);
+        cJSON_AddItemToObject(body, "contents", gemini_msgs);
     } else {
         cJSON_AddStringToObject(body, "system", system_prompt);
 
@@ -688,6 +818,37 @@ esp_err_t llm_chat_tools(const char *system_prompt,
                 }
             }
         }
+    } else if (provider_is_gemini()) {
+        cJSON *candidates = cJSON_GetObjectItem(root, "candidates");
+        cJSON *candidate0 = candidates && cJSON_IsArray(candidates) ? cJSON_GetArrayItem(candidates, 0) : NULL;
+        cJSON *content = candidate0 ? cJSON_GetObjectItem(candidate0, "content") : NULL;
+        cJSON *parts = content ? cJSON_GetObjectItem(content, "parts") : NULL;
+        if (parts && cJSON_IsArray(parts)) {
+            size_t total_text = 0;
+            cJSON *part;
+            cJSON_ArrayForEach(part, parts) {
+                cJSON *text = cJSON_GetObjectItem(part, "text");
+                if (text && cJSON_IsString(text)) {
+                    total_text += strlen(text->valuestring);
+                }
+            }
+
+            if (total_text > 0) {
+                resp->text = calloc(1, total_text + 1);
+                if (resp->text) {
+                    cJSON *part;
+                    cJSON_ArrayForEach(part, parts) {
+                        cJSON *text = cJSON_GetObjectItem(part, "text");
+                        if (!text || !cJSON_IsString(text)) continue;
+                        size_t tlen = strlen(text->valuestring);
+                        memcpy(resp->text + resp->text_len, text->valuestring, tlen);
+                        resp->text_len += tlen;
+                    }
+                    resp->text[resp->text_len] = '\0';
+                }
+            }
+        }
+        resp->tool_use = false;
     } else {
         /* stop_reason */
         cJSON *stop_reason = cJSON_GetObjectItem(root, "stop_reason");

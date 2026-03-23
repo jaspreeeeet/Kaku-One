@@ -59,6 +59,7 @@ static const char ONBOARD_HTML[] =
 "<select id='provider'>"
 "<option value='anthropic'>Anthropic</option>"
 "<option value='openai'>OpenAI</option>"
+"<option value='gemini'>Gemini</option>"
 "</select>"
 "</div></div>"
 
