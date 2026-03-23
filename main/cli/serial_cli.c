@@ -12,6 +12,7 @@
 #include "cron/cron_service.h"
 #include "heartbeat/heartbeat.h"
 #include "skills/skill_loader.h"
+#include "display/mjpeg_client.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -273,6 +274,30 @@ static int cmd_set_proxy(int argc, char **argv)
 
     http_proxy_set(proxy_args.host->sval[0], (uint16_t)proxy_args.port->ival[0], proxy_type);
     printf("Proxy set. Restart to apply.\n");
+    return 0;
+}
+
+/* --- set_display_server command --- */
+static struct {
+    struct arg_str *url;
+    struct arg_end *end;
+} display_server_args;
+
+static int cmd_set_display_server(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&display_server_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, display_server_args.end, argv[0]);
+        return 1;
+    }
+    const char *url = display_server_args.url->sval[0];
+    esp_err_t err = mjpeg_client_set_server_url(url);
+    if (err == ESP_OK) {
+        printf("Display server URL saved: %s\nRestart to reconnect stream.\n", url);
+    } else {
+        printf("Failed to save URL (err %d)\n", err);
+        return 1;
+    }
     return 0;
 }
 
@@ -567,6 +592,7 @@ static int cmd_config_show(int argc, char **argv)
     print_config_u16("Proxy Port", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_PORT, MIMI_SECRET_PROXY_PORT);
     print_config("Search Key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_API_KEY,  MIMI_SECRET_SEARCH_KEY, true);
     print_config("Tavily Key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_TAVILY_KEY, MIMI_SECRET_TAVILY_KEY, true);
+    printf("Display URL:  %s\n", mjpeg_client_get_server_url());
     printf("=============================\n");
     return 0;
 }
@@ -575,9 +601,9 @@ static int cmd_config_show(int argc, char **argv)
 static int cmd_config_reset(int argc, char **argv)
 {
     const char *namespaces[] = {
-        MIMI_NVS_WIFI, MIMI_NVS_TG, MIMI_NVS_LLM, MIMI_NVS_PROXY, MIMI_NVS_SEARCH
+        MIMI_NVS_WIFI, MIMI_NVS_TG, MIMI_NVS_LLM, MIMI_NVS_PROXY, MIMI_NVS_SEARCH, "mimi_disp"
     };
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         nvs_handle_t nvs;
         if (nvs_open(namespaces[i], NVS_READWRITE, &nvs) == ESP_OK) {
             nvs_erase_all(nvs);
@@ -1015,6 +1041,17 @@ esp_err_t serial_cli_init(void)
         .func = &cmd_clear_proxy,
     };
     esp_console_cmd_register(&clear_proxy_cmd);
+
+    /* set_display_server */
+    display_server_args.url = arg_str1(NULL, NULL, "<url>", "Expression server base URL (e.g. http://192.168.1.10:8000)");
+    display_server_args.end = arg_end(1);
+    esp_console_cmd_t display_server_cmd = {
+        .command = "set_display_server",
+        .help = "Set expression/display server URL (e.g. set_display_server http://192.168.1.10:8000)",
+        .func = &cmd_set_display_server,
+        .argtable = &display_server_args,
+    };
+    esp_console_cmd_register(&display_server_cmd);
 
     /* config_show */
     esp_console_cmd_t config_show_cmd = {
