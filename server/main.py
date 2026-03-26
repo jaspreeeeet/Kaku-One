@@ -18,7 +18,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -188,6 +188,42 @@ async def list_assets():
                 count = len([f for f in os.listdir(folder) if f.endswith(".jpg")])
                 result[name] = count
     return {"animations": result}
+
+
+ALLOWED_SUBFOLDERS = {"base", "eyes", "mouths", "extras"}
+
+@app.post("/api/assets/upload", summary="Upload PNG sprite asset")
+async def upload_asset(
+    subfolder: str = Form(...),
+    file: UploadFile = File(...),
+):
+    if subfolder not in ALLOWED_SUBFOLDERS:
+        raise HTTPException(status_code=400, detail=f"Invalid subfolder. Must be one of: {ALLOWED_SUBFOLDERS}")
+    if not file.filename or not file.filename.lower().endswith(".png"):
+        raise HTTPException(status_code=400, detail="Only .png files are accepted")
+
+    dest_dir = os.path.join(ASSETS_DIR, subfolder)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # Sanitize filename to prevent path traversal
+    safe_name = os.path.basename(file.filename)
+    dest_path = os.path.join(dest_dir, safe_name)
+
+    content = await file.read()
+    with open(dest_path, "wb") as f:
+        f.write(content)
+
+    rel_path = f"{subfolder}/{safe_name}"
+    log.info("Asset uploaded: %s (%d bytes)", rel_path, len(content))
+    invalidate_animation_cache()
+    return {"status": "ok", "path": rel_path}
+
+
+# ── health check ───────────────────────────────────────────────────────────────
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    return {"ok": True}
 
 
 # ── dashboard ──────────────────────────────────────────────────────────────────
