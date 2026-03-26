@@ -24,10 +24,15 @@ idf_component_register(
         "tools/gpio_policy.c"
         "skills/skill_loader.c"
         "onboard/wifi_onboard.c"
+        "display/mjpeg_client.c"
+        "display/amoled_driver.c"
+        "display/frame_renderer.c"
+        "tools/tool_expression.c"
     INCLUDE_DIRS
         "."
     REQUIRES
         nvs_flash esp_wifi esp_netif esp_http_client esp_http_server
         esp_https_ota esp_event json spiffs console vfs app_update esp-tls
         esp_timer esp_websocket_client esp_driver_gpio
+        esp_lcd esp_driver_spi read_lcd_id_bsp esp_lcd_sh8601
 )

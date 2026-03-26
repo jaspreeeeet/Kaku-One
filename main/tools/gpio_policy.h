@@ -3,10 +3,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* GPIO defaults for ESP32-S3-LCD-1.47B safe user-accessible pins */
+/* GPIO defaults for ESP32-S3 Waveshare 1.43" AMOLED safe user-accessible pins.
+ * Pins 9-14, 21, 42 are reserved for the AMOLED QSPI display and must not be
+ * exposed to LLM GPIO tool operations. */
 #define MIMI_GPIO_MIN_PIN       1
-#define MIMI_GPIO_MAX_PIN       21
-#define MIMI_GPIO_ALLOWED_CSV   "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,21,38,46"
+#define MIMI_GPIO_MAX_PIN       48
+#define MIMI_GPIO_ALLOWED_CSV   "1,2,3,4,5,6,7,8,15,16,17,18,38,46,47,48"
 
 /**
  * Check if a pin is allowed for user GPIO operations.

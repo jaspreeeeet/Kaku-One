@@ -5,6 +5,7 @@
 #include "tools/tool_files.h"
 #include "tools/tool_cron.h"
 #include "tools/tool_gpio.h"
+#include "tools/tool_expression.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -176,6 +177,28 @@ esp_err_t tool_registry_init(void)
         .execute = tool_cron_remove_execute,
     };
     register_tool(&cr);
+
+    /* Register set_expression */
+    tool_expression_init();
+
+    mimi_tool_t se = {
+        .name = "set_expression",
+        .description = "Set the character's facial expression on the round AMOLED display. "
+                       "Call this to show emotions that match your response — e.g. happy when "
+                       "good news, sad when empathising, thinking when problem-solving.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"expression\":{\"type\":\"string\","
+              "\"description\":\"Expression name. One of: idle, happy, sad, angry, surprised, "
+              "thinking, talking, sleeping, confused, excited, smug, embarrassed\"},"
+            "\"intensity\":{\"type\":\"number\","
+              "\"description\":\"Intensity 0.0-1.0 (optional, default 1.0)\"}"
+            "},"
+            "\"required\":[\"expression\"]}",
+        .execute = tool_expression_execute,
+    };
+    register_tool(&se);
 
     /* Register GPIO tools */
     tool_gpio_init();

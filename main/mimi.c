@@ -26,6 +26,9 @@
 #include "heartbeat/heartbeat.h"
 #include "skills/skill_loader.h"
 #include "onboard/wifi_onboard.h"
+#include "display/amoled_driver.h"
+#include "display/frame_renderer.h"
+#include "display/mjpeg_client.h"
 
 static const char *TAG = "mimi";
 
@@ -122,6 +125,12 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(init_spiffs());
 
+    /* Initialise AMOLED display early so it can show content as soon as
+     * the MJPEG stream connects.  Done before WiFi to avoid racing with
+     * the SPI bus during boot. */
+    ESP_ERROR_CHECK(amoled_init());
+    ESP_ERROR_CHECK(frame_renderer_init(amoled_get_panel()));
+
     /* Initialize subsystems */
     ESP_ERROR_CHECK(message_bus_init());
     ESP_ERROR_CHECK(memory_store_init());
@@ -136,6 +145,7 @@ void app_main(void)
     ESP_ERROR_CHECK(cron_service_init());
     ESP_ERROR_CHECK(heartbeat_init());
     ESP_ERROR_CHECK(agent_loop_init());
+    ESP_ERROR_CHECK(mjpeg_client_init(frame_render_jpeg)); /* real display callback */
 
     /* Start Serial CLI first (works without WiFi) */
     ESP_ERROR_CHECK(serial_cli_init());
@@ -182,6 +192,10 @@ void app_main(void)
         cron_service_start();
         heartbeat_start();
         ESP_ERROR_CHECK(ws_server_start());
+
+        /* Start streaming MJPEG frames from the expression server to the AMOLED.
+         * The server URL must be configured via: set_display_server http://<ip>:8000 */
+        mjpeg_client_start();
 
         ESP_LOGI(TAG, "All services started!");
     }

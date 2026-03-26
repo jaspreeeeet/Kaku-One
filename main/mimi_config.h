@@ -47,6 +47,26 @@
 #define MIMI_SECRET_TAVILY_KEY      ""
 #endif
 
+/* Display / Expression Server */
+/* Base URL of the Python expression server (no trailing slash).
+ * Can be overridden at runtime with the CLI command:
+ *   set_display_server http://<ip>:8000  */
+#ifndef MIMI_EXPR_SERVER_URL
+#define MIMI_EXPR_SERVER_URL        ""
+#endif
+
+/* AMOLED display pin mapping — Waveshare ESP32-S3 1.43" AMOLED (SH8601/CO5300 QSPI) */
+#define MIMI_LCD_PIN_CS     9   /* QSPI Chip Select                */
+#define MIMI_LCD_PIN_CLK    10  /* QSPI Clock                      */
+#define MIMI_LCD_PIN_D0     11  /* QSPI Data 0                     */
+#define MIMI_LCD_PIN_D1     12  /* QSPI Data 1                     */
+#define MIMI_LCD_PIN_D2     13  /* QSPI Data 2                     */
+#define MIMI_LCD_PIN_D3     14  /* QSPI Data 3                     */
+#define MIMI_LCD_PIN_RST    21  /* LCD Reset                       */
+#define MIMI_LCD_PIN_PWREN  42  /* Power Enable (active high)      */
+#define MIMI_LCD_H_RES      466 /* Horizontal resolution (pixels)  */
+#define MIMI_LCD_V_RES      466 /* Vertical resolution (pixels)    */
+
 /* WiFi */
 #define MIMI_WIFI_MAX_RETRY          10
 #define MIMI_WIFI_RETRY_BASE_MS      1000
