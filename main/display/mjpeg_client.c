@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include "esp_log.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -139,6 +140,7 @@ static void mjpeg_stream_loop(void)
         .timeout_ms     = 10000,
         .buffer_size    = READ_BUF_SIZE,
         .keep_alive_enable = true,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
