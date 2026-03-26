@@ -1,5 +1,12 @@
 /* MimiClaw Expression Dashboard — app.js */
 
+// Backend API base URL — empty string means same origin (local dev),
+// set to Cloud Run URL when frontend is hosted on Vercel
+const API_BASE = window.MIMICLAW_API_BASE
+  || (location.hostname.includes('vercel.app')
+      ? 'https://mimiclaw-server-90943350924.asia-south1.run.app'
+      : '');
+
 const EXPRESSION_ICONS = {
   idle:        '😐',
   happy:       '😄',
@@ -31,19 +38,20 @@ async function init() {
 }
 
 function setStreamUrl() {
-  const url = `${location.origin}/stream`;
+  const url = `${API_BASE}/stream`;
   const el = document.getElementById('stream-url');
   el.textContent = url;
   el.href = url;
+  document.getElementById('stream-img').src = url;
   document.getElementById('cli-hint').textContent =
-    `set_display_server ${location.origin}`;
+    `set_display_server ${API_BASE || location.origin}`;
 }
 
 // ── Expression buttons ────────────────────────────────────────────────────────
 
 async function loadExpressions() {
   try {
-    const res = await fetch('/expressions');
+    const res = await fetch(`${API_BASE}/expressions`);
     const { expressions } = await res.json();
     renderButtons(expressions);
   } catch (e) {
@@ -66,7 +74,7 @@ function renderButtons(expressions) {
 
 async function setExpression(name) {
   try {
-    const res = await fetch('/expression', {
+    const res = await fetch(`${API_BASE}/expression`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ expression: name }),
@@ -91,7 +99,7 @@ function updateActiveButton(name) {
 
 async function pollStatus() {
   try {
-    const res = await fetch('/api/status');
+    const res = await fetch(`${API_BASE}/api/status`);
     if (!res.ok) throw new Error(res.status);
     const data = await res.json();
 
@@ -116,7 +124,7 @@ function setBadge(state) {
 
 async function loadAnimationConfig() {
   try {
-    const res = await fetch('/api/animation');
+    const res = await fetch(`${API_BASE}/api/animation`);
     if (!res.ok) throw new Error(res.status);
     const cfg = await res.json();
     fillAnimationForm(cfg);
@@ -156,7 +164,7 @@ function setupAnimationControls() {
     statusEl.className = '';
 
     try {
-      const res = await fetch('/api/animation', {
+      const res = await fetch(`${API_BASE}/api/animation`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -184,7 +192,7 @@ function onStreamError() {
   // Try to reload the stream after a short delay
   const img = document.getElementById('stream-img');
   setTimeout(() => {
-    img.src = `/stream?t=${Date.now()}`;
+    img.src = `${API_BASE}/stream?t=${Date.now()}`;
   }, 3000);
 }
 
@@ -222,7 +230,7 @@ function setupUpload() {
     statusEl.className = '';
 
     try {
-      const res = await fetch('/api/assets/upload', { method: 'POST', body: form });
+      const res = await fetch(`${API_BASE}/api/assets/upload`, { method: 'POST', body: form });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || res.status);
       statusEl.textContent = `✓ Uploaded ${data.path}`;
