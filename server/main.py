@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -47,6 +48,18 @@ app = FastAPI(
     description="Dynamic MJPEG expression streaming for ESP32-S3 round AMOLED",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+# CORS — allow Vercel frontend and local dev
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://mimiclaw-pi.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:5500",
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Serve static files (dashboard assets)
