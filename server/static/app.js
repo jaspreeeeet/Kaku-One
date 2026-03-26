@@ -4,7 +4,7 @@
 // set to Cloud Run URL when frontend is hosted on Vercel
 const API_BASE = window.MIMICLAW_API_BASE
   || (location.hostname.includes('vercel.app')
-      ? 'https://mimiclaw-server-90943350924.asia-south1.run.app'
+      ? 'https://kaku-one-90943350924.europe-west1.run.app'
       : '');
 
 const EXPRESSION_ICONS = {
