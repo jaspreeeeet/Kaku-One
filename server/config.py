@@ -42,3 +42,7 @@ ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 # Server
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", 8000))
+
+# External integration targets
+ESP32WINAMP_BASE_URL = os.getenv("ESP32WINAMP_BASE_URL", "").rstrip("/")
+ESP32WINAMP_TIMEOUT_S = _float_env("ESP32WINAMP_TIMEOUT_S", 15.0, 1.0, 120.0)

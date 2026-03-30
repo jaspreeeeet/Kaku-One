@@ -1,8 +1,10 @@
 {
   "version": 2,
-  "buildCommand": null,
   "outputDirectory": "server/static",
   "rewrites": [
-    { "source": "/static/:path*", "destination": "/:path*" }
+    {
+      "source": "/",
+      "destination": "/index-v2.html"
+    }
   ]
 }

@@ -18,20 +18,22 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import APIRouter, FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from engine.animator import animator
+from engine.animator_runtime import animator
 from engine.expressions import EXPRESSIONS, invalidate_animation_cache
 from config import HOST, PORT, ASSETS_DIR
+from integration.esp32winamp import router as esp32winamp_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+MJPEG_BOUNDARY = "frame"
 
 
 # ── lifespan ──────────────────────────────────────────────────────────────────
@@ -84,13 +86,12 @@ async def _mjpeg_generator(queue: asyncio.Queue):
             try:
                 frame: bytes = await asyncio.wait_for(queue.get(), timeout=3.0)
             except asyncio.TimeoutError:
-                # Send a keep-alive comment to prevent client timeout
-                yield b"--frame\r\nContent-Type: text/plain\r\n\r\n\r\n"
+                yield b": keep-alive\r\n\r\n"
                 continue
 
             content_length = len(frame)
             yield (
-                b"--frame\r\n"
+                b"--" + MJPEG_BOUNDARY.encode() + b"\r\n"
                 b"Content-Type: image/jpeg\r\n"
                 b"Content-Length: " + str(content_length).encode() + b"\r\n"
                 b"\r\n" + frame + b"\r\n"
@@ -100,7 +101,7 @@ async def _mjpeg_generator(queue: asyncio.Queue):
 
 
 @app.get("/stream", summary="MJPEG live stream")
-async def stream():
+async def stream(request: Request):
     """
     Multipart MJPEG stream.
     Open directly in browser or use as <img src="/stream">.
@@ -111,14 +112,22 @@ async def stream():
     async def cleanup():
         try:
             async for chunk in _mjpeg_generator(queue):
+                if await request.is_disconnected():
+                    break
                 yield chunk
         finally:
             animator.unsubscribe(queue)
 
     return StreamingResponse(
         cleanup(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-        headers={"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"},
+        media_type=f"multipart/x-mixed-replace; boundary={MJPEG_BOUNDARY}",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate, no-transform",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -151,6 +160,7 @@ async def api_status():
     animation = await animator.get_animation_config()
     return {
         "status": "running",
+        "system": "mimiclaw",
         "current_expression": animator.current_expression,
         "available_expressions": list(EXPRESSIONS.keys()),
         "connected_clients": animator.subscriber_count,
@@ -230,7 +240,7 @@ async def healthz():
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def dashboard():
-    html_path = os.path.join(STATIC_DIR, "index.html")
+    html_path = os.path.join(STATIC_DIR, "index-v2.html")
     if os.path.exists(html_path):
         with open(html_path, encoding="utf-8") as f:
             return HTMLResponse(f.read())
@@ -241,6 +251,69 @@ async def dashboard():
 
 
 # ── entrypoint ────────────────────────────────────────────────────────────────
+
+@app.get("/app-v2.js", include_in_schema=False)
+async def app_v2():
+    return FileResponse(os.path.join(STATIC_DIR, "app-v2.js"), media_type="application/javascript")
+
+
+@app.get("/style-v2.css", include_in_schema=False)
+async def style_v2():
+    return FileResponse(os.path.join(STATIC_DIR, "style-v2.css"), media_type="text/css")
+
+
+mimiclaw_router = APIRouter(prefix="/mimiclaw", tags=["mimiclaw"])
+
+
+@mimiclaw_router.get("/stream")
+async def namespaced_stream(request: Request):
+    return await stream(request)
+
+
+@mimiclaw_router.get("/expression")
+async def namespaced_get_expression():
+    return await get_expression()
+
+
+@mimiclaw_router.post("/expression")
+async def namespaced_set_expression(req: ExpressionRequest):
+    return await set_expression(req)
+
+
+@mimiclaw_router.get("/expressions")
+async def namespaced_list_expressions():
+    return await list_expressions()
+
+
+@mimiclaw_router.get("/api/status")
+async def namespaced_status():
+    return await api_status()
+
+
+@mimiclaw_router.get("/api/animation")
+async def namespaced_get_animation():
+    return await get_animation_config()
+
+
+@mimiclaw_router.post("/api/animation")
+async def namespaced_set_animation(req: AnimationConfigRequest):
+    return await set_animation_config(req)
+
+
+app.include_router(mimiclaw_router)
+app.include_router(esp32winamp_router)
+
+
+@app.get("/api/systems", summary="Integration status")
+async def systems_status():
+    return {
+        "mimiclaw": await api_status(),
+        "esp32winamp": {
+            "configured": bool(os.getenv("ESP32WINAMP_BASE_URL")),
+            "proxy_prefix": "/esp32winamp",
+        },
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
