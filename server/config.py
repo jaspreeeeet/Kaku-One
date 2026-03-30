@@ -42,7 +42,3 @@ ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 # Server
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", 8000))
-
-# External integration targets (production-only)
-ESP32WINAMP_BASE_URL = "https://kaku-one-90943350924.europe-west1.run.app"
-ESP32WINAMP_TIMEOUT_S = 15.0

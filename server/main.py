@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 from engine.animator_runtime import animator
 from engine.expressions import EXPRESSIONS, invalidate_animation_cache
 from config import HOST, PORT, ASSETS_DIR
-from integration.esp32winamp import router as esp32winamp_router
+from music.local_music import router as local_music_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -301,7 +301,7 @@ async def namespaced_set_animation(req: AnimationConfigRequest):
 
 
 app.include_router(mimiclaw_router)
-app.include_router(esp32winamp_router)
+app.include_router(local_music_router)
 
 
 @app.get("/api/systems", summary="Integration status")
@@ -310,7 +310,7 @@ async def systems_status():
         "mimiclaw": await api_status(),
         "esp32winamp": {
             "configured": True,
-            "proxy_prefix": "/esp32winamp",
+            "proxy_prefix": "/music",
         },
     }
 

@@ -9,10 +9,12 @@ const ROUTES = {
     stream: `${API_BASE}/mimiclaw/stream`,
     upload: `${API_BASE}/api/assets/upload`,
   },
-  esp32winamp: {
-    health: `${API_BASE}/esp32winamp/health`,
-    list: `${API_BASE}/esp32winamp/list`,
-    music: `${API_BASE}/esp32winamp/music`,
+  music: {
+    health: `${API_BASE}/music/health`,
+    list: `${API_BASE}/music/list`,
+    upload: `${API_BASE}/music/upload`,
+    stream: `${API_BASE}/music/stream`,
+    file: `${API_BASE}/music`,
   },
 };
 
@@ -110,8 +112,8 @@ function renderLayout() {
     <section id="esp32winamp-panel" class="system-panel">
       <div class="panel-grid panel-grid-single">
         <section class="integration-section">
-          <h2>ESP32 Winamp Proxy</h2>
-          <p class="section-copy">This module stays isolated behind the integration gateway and proxies the local music server through the mimiclaw backend.</p>
+          <h2>ESP32 Winamp Local Music</h2>
+          <p class="section-copy">Upload MP3 files locally or stream them directly from a URL. No upstream proxy required.</p>
           <div class="meta-grid">
             <div>
               <span class="meta-label">Proxy status</span>
@@ -119,7 +121,7 @@ function renderLayout() {
             </div>
             <div>
               <span class="meta-label">Proxy route</span>
-              <code>/esp32winamp/*</code>
+              <code>/music/*</code>
             </div>
             <div>
               <span class="meta-label">Catalog size</span>
@@ -136,6 +138,30 @@ function renderLayout() {
           <div id="esp32-empty" class="empty-state">No tracks loaded yet.</div>
           <ul id="esp32-track-list" class="track-list"></ul>
           <audio id="esp32-player" controls preload="none" class="player"></audio>
+        </section>
+
+        <section class="tracks-section">
+          <h2>Upload MP3</h2>
+          <form id="music-upload-form">
+            <label class="file-label">
+              <input type="file" id="music-upload-file" accept=".mp3" required />
+              <span id="music-upload-label">Choose MP3...</span>
+            </label>
+            <button type="submit" class="btn primary">Upload</button>
+            <span id="music-upload-status"></span>
+          </form>
+        </section>
+
+        <section class="tracks-section">
+          <h2>Play From URL</h2>
+          <form id="music-url-form">
+            <label>
+              MP3 URL
+              <input id="music-url-input" type="url" placeholder="https://example.com/song.mp3" required />
+            </label>
+            <button type="submit" class="btn primary">Stream</button>
+            <span id="music-url-status"></span>
+          </form>
         </section>
       </div>
     </section>
@@ -305,13 +331,13 @@ async function pollStatus() {
   }
 }
 
-async function refreshEsp32Catalog() {
-  const healthRes = await fetch(ROUTES.esp32winamp.health);
+async function refreshMusicCatalog() {
+  const healthRes = await fetch(ROUTES.music.health);
   const health = await healthRes.json();
   document.getElementById('esp32-status').textContent = healthRes.ok ? 'Online' : `Offline (${health.detail || healthRes.status})`;
-  document.getElementById('esp32-count').textContent = health.songs ?? '--';
+  document.getElementById('esp32-count').textContent = health.tracks ?? '--';
 
-  const listRes = await fetch(ROUTES.esp32winamp.list);
+  const listRes = await fetch(ROUTES.music.list);
   const listData = await listRes.json();
   const list = document.getElementById('esp32-track-list');
   const empty = document.getElementById('esp32-empty');
@@ -320,7 +346,7 @@ async function refreshEsp32Catalog() {
   list.innerHTML = '';
   const tracks = listRes.ok ? (listData.tracks || []) : [];
   if (!tracks.length) {
-    empty.textContent = listRes.ok ? 'No tracks available from the upstream music server.' : `Catalog unavailable: ${listData.detail || listRes.status}`;
+    empty.textContent = listRes.ok ? 'No tracks available yet.' : `Catalog unavailable: ${listData.detail || listRes.status}`;
     empty.style.display = 'block';
     return;
   }
@@ -335,12 +361,65 @@ async function refreshEsp32Catalog() {
     button.className = 'track-button';
     button.textContent = track;
     button.addEventListener('click', () => {
-      player.src = `${ROUTES.esp32winamp.music}/${encodeURIComponent(track)}`;
+      player.src = `${ROUTES.music.file}/${encodeURIComponent(track)}`;
       player.play().catch(() => {});
     });
 
     item.appendChild(button);
     list.appendChild(item);
+  });
+}
+
+function setupMusicUpload() {
+  const input = document.getElementById('music-upload-file');
+  const label = document.getElementById('music-upload-label');
+  const status = document.getElementById('music-upload-status');
+
+  input.addEventListener('change', () => {
+    label.textContent = input.files[0]?.name || 'Choose MP3...';
+  });
+
+  document.getElementById('music-upload-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!input.files[0]) {
+      return;
+    }
+    status.textContent = 'Uploading...';
+    status.className = '';
+
+    const form = new FormData();
+    form.append('file', input.files[0]);
+    const response = await fetch(ROUTES.music.upload, { method: 'POST', body: form });
+    const data = await response.json();
+    if (!response.ok) {
+      status.textContent = data.detail || 'Upload failed';
+      status.className = 'error';
+      return;
+    }
+
+    status.textContent = `Uploaded ${data.filename}`;
+    input.value = '';
+    label.textContent = 'Choose MP3...';
+    await refreshMusicCatalog();
+  });
+}
+
+function setupMusicUrlStream() {
+  const input = document.getElementById('music-url-input');
+  const status = document.getElementById('music-url-status');
+  const player = document.getElementById('esp32-player');
+
+  document.getElementById('music-url-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    status.textContent = '';
+    const url = input.value.trim();
+    if (!url) {
+      return;
+    }
+    status.textContent = 'Streaming...';
+    const streamUrl = `${ROUTES.music.stream}?url=${encodeURIComponent(url)}`;
+    player.src = streamUrl;
+    player.play().catch(() => {});
   });
 }
 
@@ -350,13 +429,15 @@ async function init() {
   setStreamUrl();
   setupAnimationForm();
   setupUploadForm();
-  document.getElementById('esp32-refresh').addEventListener('click', refreshEsp32Catalog);
+  document.getElementById('esp32-refresh').addEventListener('click', refreshMusicCatalog);
+  setupMusicUpload();
+  setupMusicUrlStream();
 
   await Promise.all([
     loadExpressions(),
     loadAnimationConfig(),
     pollStatus(),
-    refreshEsp32Catalog(),
+    refreshMusicCatalog(),
   ]);
 
   setInterval(pollStatus, 2000);
