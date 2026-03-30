@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 from engine.animator_runtime import animator
 from engine.expressions import EXPRESSIONS, invalidate_animation_cache
 from config import HOST, PORT, ASSETS_DIR
-from music.local_music import router as local_music_router
+from music.local_music import router as local_music_router, _ensure_upload_dir
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -40,6 +40,8 @@ MJPEG_BOUNDARY = "frame"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _ensure_upload_dir()
+    log.info("Registered routes: %s", sorted(route.path for route in app.routes))
     await animator.start()
     yield
     await animator.stop()
@@ -234,6 +236,13 @@ async def upload_asset(
 @app.get("/healthz", include_in_schema=False)
 async def healthz():
     return {"ok": True}
+
+
+@app.get("/debug/routes", include_in_schema=False)
+async def debug_routes():
+    return {
+        "routes": sorted(route.path for route in app.routes),
+    }
 
 
 # ── dashboard ──────────────────────────────────────────────────────────────────
