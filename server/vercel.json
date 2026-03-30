@@ -1,7 +1,5 @@
 {
   "version": 2,
-  "buildCommand": "echo 'No build step'",
-  "outputDirectory": "static",
   "builds": [
     {
       "src": "main.py",

@@ -42,9 +42,11 @@ MJPEG_BOUNDARY = "frame"
 async def lifespan(app: FastAPI):
     _ensure_upload_dir()
     log.info("Registered routes: %s", sorted(route.path for route in app.routes))
-    await animator.start()
+    if not os.environ.get("VERCEL"):
+        await animator.start()
     yield
-    await animator.stop()
+    if not os.environ.get("VERCEL"):
+        await animator.stop()
 
 
 app = FastAPI(
