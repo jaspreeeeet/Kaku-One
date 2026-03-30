@@ -52,7 +52,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — allow Vercel frontend and local dev
+# CORS — allow same-origin frontend and production dashboards
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -309,7 +309,7 @@ async def systems_status():
     return {
         "mimiclaw": await api_status(),
         "esp32winamp": {
-            "configured": bool(os.getenv("ESP32WINAMP_BASE_URL")),
+            "configured": True,
             "proxy_prefix": "/esp32winamp",
         },
     }

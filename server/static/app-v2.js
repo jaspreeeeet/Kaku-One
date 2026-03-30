@@ -1,7 +1,4 @@
-const API_BASE = window.MIMICLAW_API_BASE
-  || (location.hostname.includes('vercel.app')
-    ? 'https://kaku-one-90943350924.europe-west1.run.app'
-    : '');
+const API_BASE = '';
 
 const ROUTES = {
   mimiclaw: {
