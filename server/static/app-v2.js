@@ -416,7 +416,24 @@ function setupMusicUrlStream() {
     if (!url) {
       return;
     }
-    status.textContent = 'Streaming...';
+    status.textContent = 'Sending stream command to ESP32...';
+
+    const response = await fetch(`${API_BASE}/music/esp32/play-url`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    const data = await response.json();
+
+    if (!response.ok) {
+      status.textContent = data.detail || 'Failed to send stream command';
+      status.className = 'error';
+      return;
+    }
+
+    status.textContent = 'ESP32 will start the remote stream.';
+    status.className = 'success';
+
     const streamUrl = `${ROUTES.music.stream}?url=${encodeURIComponent(url)}`;
     player.src = streamUrl;
     player.play().catch(() => {});

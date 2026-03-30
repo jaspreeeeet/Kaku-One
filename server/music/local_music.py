@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from threading import Lock
 from typing import AsyncIterator
 from urllib.parse import urlparse
 
@@ -8,6 +9,7 @@ import httpx
 import requests
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 if os.environ.get("VERCEL"):
@@ -16,6 +18,18 @@ else:
     UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 
 router = APIRouter(prefix="/music", tags=["music"])
+_command_lock = Lock()
+_command_version = 0
+_latest_command: dict[str, object] = {
+    "version": 0,
+    "action": "idle",
+    "source_url": "",
+    "stream_url": "",
+}
+
+
+class Esp32PlayUrlRequest(BaseModel):
+    url: str
 
 
 def _ensure_upload_dir() -> None:
@@ -32,6 +46,13 @@ def _list_mp3() -> list[str]:
     return sorted([f for f in os.listdir(UPLOAD_DIR) if f.lower().endswith(".mp3")])
 
 
+def _validate_remote_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="Only http/https URLs are allowed")
+    return url
+
+
 @router.get("/list")
 def list_music() -> dict[str, list[str]]:
     _ensure_upload_dir()
@@ -42,6 +63,31 @@ def list_music() -> dict[str, list[str]]:
 def music_health() -> dict[str, object]:
     _ensure_upload_dir()
     return {"status": "ok", "tracks": len(_list_mp3())}
+
+
+@router.get("/esp32/command")
+def get_esp32_command() -> dict[str, object]:
+    with _command_lock:
+        return dict(_latest_command)
+
+
+@router.post("/esp32/play-url")
+def set_esp32_play_url(payload: Esp32PlayUrlRequest) -> JSONResponse:
+    global _command_version
+
+    source_url = _validate_remote_url(payload.url.strip())
+    stream_url = f"/music/stream?url={source_url}"
+    with _command_lock:
+        _command_version += 1
+        _latest_command.update({
+            "version": _command_version,
+            "action": "play_url",
+            "source_url": source_url,
+            "stream_url": stream_url,
+        })
+        command = dict(_latest_command)
+
+    return JSONResponse({"status": "ok", **command})
 
 
 @router.post("/upload")
@@ -59,9 +105,7 @@ async def upload_music(file: UploadFile = File(...)) -> JSONResponse:
 
 @router.get("/stream")
 def stream_url(url: str = Query(..., min_length=8)) -> StreamingResponse:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise HTTPException(status_code=400, detail="Only http/https URLs are allowed")
+    _validate_remote_url(url)
 
     try:
         response = requests.get(url, stream=True, timeout=10)
