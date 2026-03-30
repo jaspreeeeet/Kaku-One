@@ -1,4 +1,4 @@
-const API_BASE = '';
+const API_BASE = 'https://kaku-one-90943350924.europe-west1.run.app';
 
 const ROUTES = {
   mimiclaw: {
