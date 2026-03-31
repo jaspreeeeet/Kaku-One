@@ -1,6 +1,6 @@
 const API_BASE =
   window.location.hostname === 'mimiclaw-rust.vercel.app'
-    ? 'https://kaku-one-gamma.vercel.app'
+    ? 'https://server-five-nu-67.vercel.app'
     : window.location.origin;
 
 const ROUTES = {
