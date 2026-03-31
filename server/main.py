@@ -42,9 +42,11 @@ MJPEG_BOUNDARY = "frame"
 async def lifespan(app: FastAPI):
     _ensure_upload_dir()
     log.info("Registered routes: %s", sorted(route.path for route in app.routes))
-    await animator.start()
+    if not os.environ.get("VERCEL"):
+        await animator.start()
     yield
-    await animator.stop()
+    if not os.environ.get("VERCEL"):
+        await animator.stop()
 
 
 app = FastAPI(
@@ -272,6 +274,11 @@ async def app_v2():
 @app.get("/style-v2.css", include_in_schema=False)
 async def style_v2():
     return FileResponse(os.path.join(STATIC_DIR, "style-v2.css"), media_type="text/css")
+
+
+@app.get("/favicon.svg", include_in_schema=False)
+async def favicon():
+    return FileResponse(os.path.join(STATIC_DIR, "favicon.svg"), media_type="image/svg+xml")
 
 
 mimiclaw_router = APIRouter(prefix="/mimiclaw", tags=["mimiclaw"])

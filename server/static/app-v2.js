@@ -1,4 +1,7 @@
-const API_BASE = 'https://kaku-one-gamma.vercel.app';
+const API_BASE =
+  window.location.hostname === 'mimiclaw-rust.vercel.app'
+    ? 'https://kaku-one-gamma.vercel.app'
+    : window.location.origin;
 
 const ROUTES = {
   mimiclaw: {
@@ -15,7 +18,9 @@ const ROUTES = {
     upload: `${API_BASE}/music/upload`,
     stream: `${API_BASE}/music/stream`,
     file: `${API_BASE}/music`,
-  },
+    esp32Command: `${API_BASE}/music/esp32/command`,
+    esp32State: `${API_BASE}/music/esp32/state`,
+    },
 };
 
 const EXPRESSION_LABELS = {
@@ -34,6 +39,8 @@ const EXPRESSION_LABELS = {
 };
 
 let currentExpression = null;
+let currentEsp32State = { state: 'stopped', file: '', source: '', device_ip: '' };
+let currentTracks = [];
 
 function renderLayout() {
   document.getElementById('app-root').innerHTML = `
@@ -127,6 +134,10 @@ function renderLayout() {
               <span class="meta-label">Catalog size</span>
               <strong id="esp32-count">--</strong>
             </div>
+            <div>
+              <span class="meta-label">ESP32 state</span>
+              <strong id="esp32-playback-state">Unknown</strong>
+            </div>
           </div>
           <div class="integration-actions">
             <button id="esp32-refresh" type="button" class="btn primary">Refresh Catalog</button>
@@ -159,8 +170,35 @@ function renderLayout() {
               MP3 URL
               <input id="music-url-input" type="url" placeholder="https://example.com/song.mp3" required />
             </label>
-            <button type="submit" class="btn primary">Stream</button>
+            <div class="animation-actions">
+              <button type="submit" class="btn primary">Stream</button>
+              <button id="music-stop-button" type="button" class="btn">Stop Remote</button>
+            </div>
             <span id="music-url-status"></span>
+          </form>
+        </section>
+
+        <section class="tracks-section">
+          <h2>WiFi Setup</h2>
+          <p class="section-copy">Scan nearby WiFi networks and send a new network connection request to the ESP32.</p>
+          <form id="wifi-form">
+            <label>
+              ESP32 Device URL
+              <input id="wifi-device-url" type="url" placeholder="http://192.168.1.6" />
+            </label>
+            <div class="animation-actions">
+              <button id="wifi-scan-button" type="button" class="btn primary">Scan</button>
+              <span id="wifi-status"></span>
+            </div>
+            <div id="wifi-note" class="wifi-note"></div>
+            <div id="wifi-results" class="wifi-results"></div>
+            <label>
+              Password
+              <input id="wifi-password" type="password" placeholder="WiFi password" autocomplete="current-password" />
+            </label>
+            <div class="animation-actions">
+              <button id="wifi-connect-button" type="submit" class="btn">Connect</button>
+            </div>
           </form>
         </section>
       </div>
@@ -179,6 +217,192 @@ function setupTabs() {
         panel.classList.toggle('active', panel.id === `${system}-panel`);
       });
     });
+  });
+}
+
+function formatPlaybackState() {
+  const state = currentEsp32State.state || 'stopped';
+  const file = currentEsp32State.file || '';
+  if (file) {
+    return `${state}: ${file}`;
+  }
+  return state;
+}
+
+function updateEsp32PlaybackMeta() {
+  const stateEl = document.getElementById('esp32-playback-state');
+  if (stateEl) {
+    stateEl.textContent = formatPlaybackState();
+  }
+  const hostInput = document.getElementById('wifi-device-url');
+  if (hostInput && !hostInput.value && currentEsp32State.device_ip) {
+    hostInput.value = `http://${currentEsp32State.device_ip}`;
+  }
+}
+
+function renderTrackList(tracks) {
+  const list = document.getElementById('esp32-track-list');
+  const empty = document.getElementById('esp32-empty');
+  const player = document.getElementById('esp32-player');
+
+  list.innerHTML = '';
+  currentTracks = tracks;
+  if (!tracks.length) {
+    empty.textContent = 'No tracks available yet.';
+    empty.style.display = 'block';
+    return;
+  }
+
+  empty.style.display = 'none';
+  tracks.forEach((track) => {
+    const item = document.createElement('li');
+    item.className = 'track-item';
+
+    const name = document.createElement('button');
+    name.type = 'button';
+    name.className = 'track-button';
+    name.textContent = track;
+    name.addEventListener('click', () => {
+      player.src = `${ROUTES.music.file}/${encodeURIComponent(track)}`;
+      player.play().catch(() => {});
+    });
+
+    const controls = document.createElement('div');
+    controls.className = 'animation-actions';
+
+    const playBtn = document.createElement('button');
+    playBtn.type = 'button';
+    playBtn.className = 'btn primary';
+    playBtn.textContent = 'Play';
+    playBtn.disabled = currentEsp32State.state === 'playing' && currentEsp32State.file === track;
+    playBtn.addEventListener('click', async () => {
+      await sendEsp32FileCommand('play', track);
+    });
+
+    const pauseBtn = document.createElement('button');
+    pauseBtn.type = 'button';
+    pauseBtn.className = 'btn';
+    pauseBtn.textContent = 'Pause';
+    pauseBtn.disabled = !(currentEsp32State.file === track && currentEsp32State.state === 'playing');
+    pauseBtn.addEventListener('click', async () => {
+      await sendEsp32FileCommand('pause', track);
+    });
+
+    const stopBtn = document.createElement('button');
+    stopBtn.type = 'button';
+    stopBtn.className = 'btn';
+    stopBtn.textContent = 'Stop';
+    stopBtn.disabled = !(currentEsp32State.file === track && currentEsp32State.state !== 'stopped');
+    stopBtn.addEventListener('click', async () => {
+      await sendEsp32FileCommand('stop', track);
+    });
+
+    controls.appendChild(playBtn);
+    controls.appendChild(pauseBtn);
+    controls.appendChild(stopBtn);
+    item.appendChild(name);
+    item.appendChild(controls);
+    list.appendChild(item);
+  });
+}
+
+async function sendEsp32FileCommand(action, file) {
+  const response = await fetch(ROUTES.music.esp32Command, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, file }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.detail || `Command failed (${response.status})`);
+  }
+  await refreshEsp32State();
+  renderTrackList(currentTracks);
+  return data;
+}
+
+async function sendEsp32Command(action, extra = {}) {
+  const response = await fetch(ROUTES.music.esp32Command, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, ...extra }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.detail || `Command failed (${response.status})`);
+  }
+  await refreshEsp32State();
+  renderTrackList(currentTracks);
+  return data;
+}
+
+async function refreshEsp32State() {
+  const response = await fetch(ROUTES.music.esp32State);
+  const data = await response.json();
+  if (response.ok) {
+    currentEsp32State = data;
+    updateEsp32PlaybackMeta();
+  }
+  return data;
+}
+
+function getWifiDeviceBaseUrl() {
+  const input = document.getElementById('wifi-device-url');
+  const value = input?.value?.trim();
+  if (value) {
+    return value.replace(/\/+$/, '');
+  }
+  if (currentEsp32State.device_ip) {
+    return `http://${currentEsp32State.device_ip}`;
+  }
+  return '';
+}
+
+function setWifiStatus(message, tone = '') {
+  const status = document.getElementById('wifi-status');
+  if (!status) {
+    return;
+  }
+  status.textContent = message;
+  status.className = tone;
+}
+
+function setWifiNote(message, tone = '') {
+  const note = document.getElementById('wifi-note');
+  if (!note) {
+    return;
+  }
+  note.textContent = message;
+  note.className = `wifi-note ${tone}`.trim();
+}
+
+function renderWifiScanResults(networks) {
+  const container = document.getElementById('wifi-results');
+  if (!container) {
+    return;
+  }
+  container.innerHTML = '';
+  if (!networks.length) {
+    container.textContent = 'No WiFi networks found.';
+    return;
+  }
+
+  networks.forEach((network, index) => {
+    const label = document.createElement('label');
+    label.className = 'wifi-network';
+
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = 'wifi-ssid';
+    radio.value = network.ssid;
+    radio.checked = index === 0;
+
+    const text = document.createElement('span');
+    text.textContent = `${network.ssid} (${network.rssi} dBm)`;
+
+    label.appendChild(radio);
+    label.appendChild(text);
+    container.appendChild(label);
   });
 }
 
@@ -336,38 +560,18 @@ async function refreshMusicCatalog() {
   const health = await healthRes.json();
   document.getElementById('esp32-status').textContent = healthRes.ok ? 'Online' : `Offline (${health.detail || healthRes.status})`;
   document.getElementById('esp32-count').textContent = health.tracks ?? '--';
+  await refreshEsp32State();
 
   const listRes = await fetch(ROUTES.music.list);
   const listData = await listRes.json();
-  const list = document.getElementById('esp32-track-list');
-  const empty = document.getElementById('esp32-empty');
-  const player = document.getElementById('esp32-player');
-
-  list.innerHTML = '';
   const tracks = listRes.ok ? (listData.tracks || []) : [];
   if (!tracks.length) {
-    empty.textContent = listRes.ok ? 'No tracks available yet.' : `Catalog unavailable: ${listData.detail || listRes.status}`;
-    empty.style.display = 'block';
+    renderTrackList([]);
+    document.getElementById('esp32-empty').textContent = listRes.ok ? 'No tracks available yet.' : `Catalog unavailable: ${listData.detail || listRes.status}`;
+    document.getElementById('esp32-empty').style.display = 'block';
     return;
   }
-
-  empty.style.display = 'none';
-  tracks.forEach((track) => {
-    const item = document.createElement('li');
-    item.className = 'track-item';
-
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'track-button';
-    button.textContent = track;
-    button.addEventListener('click', () => {
-      player.src = `${ROUTES.music.file}/${encodeURIComponent(track)}`;
-      player.play().catch(() => {});
-    });
-
-    item.appendChild(button);
-    list.appendChild(item);
-  });
+  renderTrackList(tracks);
 }
 
 function setupMusicUpload() {
@@ -408,6 +612,7 @@ function setupMusicUrlStream() {
   const input = document.getElementById('music-url-input');
   const status = document.getElementById('music-url-status');
   const player = document.getElementById('esp32-player');
+  const stopButton = document.getElementById('music-stop-button');
 
   document.getElementById('music-url-form').addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -437,6 +642,100 @@ function setupMusicUrlStream() {
     const streamUrl = `${ROUTES.music.stream}?url=${encodeURIComponent(url)}`;
     player.src = streamUrl;
     player.play().catch(() => {});
+    await refreshEsp32State();
+    renderTrackList(currentTracks);
+  });
+
+  stopButton.addEventListener('click', async () => {
+    status.textContent = 'Sending stop command to ESP32...';
+    status.className = '';
+    try {
+      await sendEsp32Command('stop');
+    } catch (error) {
+      status.textContent = error.message || 'Failed to stop remote stream';
+      status.className = 'error';
+      return;
+    }
+
+    player.pause();
+    player.removeAttribute('src');
+    player.load();
+    status.textContent = 'ESP32 stop command sent.';
+    status.className = 'success';
+  });
+}
+
+function setupWifiManagement() {
+  const form = document.getElementById('wifi-form');
+  const scanButton = document.getElementById('wifi-scan-button');
+  const passwordInput = document.getElementById('wifi-password');
+
+  const refreshWifiNote = () => {
+    const deviceUrl = getWifiDeviceBaseUrl();
+    if (!deviceUrl) {
+      setWifiNote('ESP32 device URL required. It auto-fills when the board reports its IP.');
+      return false;
+    }
+    if (window.location.protocol === 'https:' && deviceUrl.startsWith('http://')) {
+      setWifiNote('WiFi setup needs the local HTTP dashboard. Browsers block HTTPS pages from calling an HTTP ESP32 directly.', 'error');
+      return false;
+    }
+    setWifiNote('');
+    return true;
+  };
+
+  document.getElementById('wifi-device-url').addEventListener('input', refreshWifiNote);
+  refreshWifiNote();
+
+  scanButton.addEventListener('click', async () => {
+    if (!refreshWifiNote()) {
+      return;
+    }
+    const deviceUrl = getWifiDeviceBaseUrl();
+    setWifiStatus('Scanning...', '');
+    try {
+      const response = await fetch(`${deviceUrl}/wifi/scan`);
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || `Scan failed (${response.status})`);
+      }
+      renderWifiScanResults(data.networks || []);
+      setWifiStatus('Scan complete.', 'success');
+    } catch (error) {
+      renderWifiScanResults([]);
+      setWifiStatus(error.message || 'Scan failed.', 'error');
+    }
+  });
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!refreshWifiNote()) {
+      return;
+    }
+    const selected = document.querySelector('input[name="wifi-ssid"]:checked');
+    if (!selected) {
+      setWifiStatus('Select an SSID first.', 'error');
+      return;
+    }
+    const deviceUrl = getWifiDeviceBaseUrl();
+    setWifiStatus('Connecting...', '');
+    try {
+      const response = await fetch(`${deviceUrl}/wifi/connect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ssid: selected.value,
+          password: passwordInput.value,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || `Connect failed (${response.status})`);
+      }
+      setWifiStatus(data.status === 'accepted' ? 'Connection request sent.' : 'Connected.', 'success');
+    } catch (error) {
+      setWifiStatus(error.message || 'Connect failed.', 'error');
+    }
   });
 }
 
@@ -449,6 +748,7 @@ async function init() {
   document.getElementById('esp32-refresh').addEventListener('click', refreshMusicCatalog);
   setupMusicUpload();
   setupMusicUrlStream();
+  setupWifiManagement();
 
   await Promise.all([
     loadExpressions(),
@@ -458,6 +758,10 @@ async function init() {
   ]);
 
   setInterval(pollStatus, 2000);
+  setInterval(async () => {
+    await refreshEsp32State();
+    renderTrackList(currentTracks);
+  }, 2000);
 }
 
 document.addEventListener('DOMContentLoaded', init);

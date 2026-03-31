@@ -275,13 +275,21 @@ input {
 }
 
 #anim-status,
-#upload-status {
+#upload-status,
+#wifi-status {
   color: var(--success);
 }
 
 #anim-status.error,
-#upload-status.error {
+#upload-status.error,
+#wifi-status.error,
+.wifi-note.error {
   color: var(--error);
+}
+
+#wifi-status.success,
+.wifi-note.success {
+  color: var(--success);
 }
 
 #info-table {
@@ -359,6 +367,27 @@ pre {
 .player {
   width: 100%;
   margin-top: 18px;
+}
+
+.wifi-note {
+  min-height: 1.2em;
+  color: var(--muted);
+}
+
+.wifi-results {
+  display: grid;
+  gap: 8px;
+}
+
+.wifi-network {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.55);
+  color: var(--ink);
 }
 
 @media (max-width: 900px) {

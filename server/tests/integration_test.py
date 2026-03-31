@@ -52,3 +52,22 @@ def test_esp32_play_url_rejects_invalid_scheme(client):
     response = client.post("/music/esp32/play-url", json={"url": "file:///tmp/test.mp3"})
     assert response.status_code == 400
     assert response.json()["detail"] == "Only http/https URLs are allowed"
+
+
+def test_esp32_state_tracks_device_ip(client):
+    response = client.post(
+        "/music/esp32/state",
+        json={
+            "state": "playing",
+            "file": "track1.mp3",
+            "source": "remote",
+            "device_ip": "192.168.1.6",
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["device_ip"] == "192.168.1.6"
+
+    current = client.get("/music/esp32/state")
+    assert current.status_code == 200
+    assert current.json()["device_ip"] == "192.168.1.6"
