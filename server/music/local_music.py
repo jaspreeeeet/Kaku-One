@@ -9,7 +9,7 @@ import httpx
 import requests
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 if os.environ.get("VERCEL"):
@@ -23,13 +23,113 @@ _command_version = 0
 _latest_command: dict[str, object] = {
     "version": 0,
     "action": "idle",
+    "file": "",
     "source_url": "",
     "stream_url": "",
+}
+_state_lock = Lock()
+_latest_state: dict[str, object] = {
+    "state": "stopped",
+    "file": "",
+    "source": "",
+    "device_ip": "",
+    "updated_at_version": 0,
 }
 
 
 class Esp32PlayUrlRequest(BaseModel):
     url: str
+
+
+class Esp32CommandRequest(BaseModel):
+    action: str
+    file: str = ""
+
+    @field_validator("action")
+    @classmethod
+    def validate_action(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"play", "pause", "stop"}:
+            raise ValueError("Action must be play, pause, or stop")
+        return normalized
+
+    @field_validator("file")
+    @classmethod
+    def validate_file(cls, value: str) -> str:
+        return _safe_name(value.strip())
+
+
+class Esp32StateUpdateRequest(BaseModel):
+    state: str
+    file: str = ""
+    source: str = ""
+    device_ip: str = ""
+
+    @field_validator("state")
+    @classmethod
+    def validate_state(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"stopped", "playing", "paused"}:
+            raise ValueError("State must be stopped, playing, or paused")
+        return normalized
+
+    @field_validator("file")
+    @classmethod
+    def validate_state_file(cls, value: str) -> str:
+        return _safe_name(value.strip())
+
+    @field_validator("source")
+    @classmethod
+    def validate_source(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"", "local", "remote"}:
+            raise ValueError("Source must be local, remote, or empty")
+        return normalized
+
+    @field_validator("device_ip")
+    @classmethod
+    def validate_device_ip(cls, value: str) -> str:
+        return value.strip()
+
+
+def _set_command(
+    action: str,
+    *,
+    file: str = "",
+    source_url: str = "",
+    stream_url: str = "",
+) -> dict[str, object]:
+    global _command_version
+
+    with _command_lock:
+        _command_version += 1
+        _latest_command.update({
+            "version": _command_version,
+            "action": action,
+            "file": file,
+            "source_url": source_url,
+            "stream_url": stream_url,
+        })
+        return dict(_latest_command)
+
+
+def _update_state(
+    *,
+    state: str,
+    file: str = "",
+    source: str = "",
+    device_ip: str = "",
+    version: int | None = None,
+) -> dict[str, object]:
+    with _state_lock:
+        _latest_state.update({
+            "state": state,
+            "file": file,
+            "source": source,
+            "device_ip": device_ip,
+            "updated_at_version": version if version is not None else _latest_state["updated_at_version"],
+        })
+        return dict(_latest_state)
 
 
 def _ensure_upload_dir() -> None:
@@ -71,23 +171,44 @@ def get_esp32_command() -> dict[str, object]:
         return dict(_latest_command)
 
 
+@router.post("/esp32/command")
+def set_esp32_command(payload: Esp32CommandRequest) -> JSONResponse:
+    if payload.action == "play" and not payload.file:
+        raise HTTPException(status_code=400, detail="File is required for play action")
+    command = _set_command(payload.action, file=payload.file)
+    return JSONResponse({"status": "ok", **command})
+
+
 @router.post("/esp32/play-url")
 def set_esp32_play_url(payload: Esp32PlayUrlRequest) -> JSONResponse:
-    global _command_version
-
     source_url = _validate_remote_url(payload.url.strip())
     stream_url = f"/music/stream?url={source_url}"
-    with _command_lock:
-        _command_version += 1
-        _latest_command.update({
-            "version": _command_version,
-            "action": "play_url",
-            "source_url": source_url,
-            "stream_url": stream_url,
-        })
-        command = dict(_latest_command)
-
+    command = _set_command("play_url", source_url=source_url, stream_url=stream_url)
     return JSONResponse({"status": "ok", **command})
+
+
+@router.post("/esp32/stop")
+def stop_esp32_stream() -> JSONResponse:
+    command = _set_command("stop")
+    return JSONResponse({"status": "ok", **command})
+
+
+@router.get("/esp32/state")
+def get_esp32_state() -> dict[str, object]:
+    with _state_lock:
+        return dict(_latest_state)
+
+
+@router.post("/esp32/state")
+def set_esp32_state(payload: Esp32StateUpdateRequest) -> JSONResponse:
+    state = _update_state(
+        state=payload.state,
+        file=payload.file,
+        source=payload.source,
+        device_ip=payload.device_ip,
+        version=_command_version,
+    )
+    return JSONResponse({"status": "ok", **state})
 
 
 @router.post("/upload")
