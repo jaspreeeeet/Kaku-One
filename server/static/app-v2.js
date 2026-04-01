@@ -178,29 +178,6 @@ function renderLayout() {
           </form>
         </section>
 
-        <section class="tracks-section">
-          <h2>WiFi Setup</h2>
-          <p class="section-copy">Scan nearby WiFi networks and send a new network connection request to the ESP32.</p>
-          <form id="wifi-form">
-            <label>
-              ESP32 Device URL
-              <input id="wifi-device-url" type="url" placeholder="http://192.168.1.6" />
-            </label>
-            <div class="animation-actions">
-              <button id="wifi-scan-button" type="button" class="btn primary">Scan</button>
-              <span id="wifi-status"></span>
-            </div>
-            <div id="wifi-note" class="wifi-note"></div>
-            <div id="wifi-results" class="wifi-results"></div>
-            <label>
-              Password
-              <input id="wifi-password" type="password" placeholder="WiFi password" autocomplete="current-password" />
-            </label>
-            <div class="animation-actions">
-              <button id="wifi-connect-button" type="submit" class="btn">Connect</button>
-            </div>
-          </form>
-        </section>
       </div>
     </section>
   `;
@@ -233,10 +210,6 @@ function updateEsp32PlaybackMeta() {
   const stateEl = document.getElementById('esp32-playback-state');
   if (stateEl) {
     stateEl.textContent = formatPlaybackState();
-  }
-  const hostInput = document.getElementById('wifi-device-url');
-  if (hostInput && !hostInput.value && currentEsp32State.device_ip) {
-    hostInput.value = `http://${currentEsp32State.device_ip}`;
   }
 }
 
@@ -556,13 +529,14 @@ async function pollStatus() {
 }
 
 async function refreshMusicCatalog() {
-  const healthRes = await fetch(ROUTES.music.health);
+  const cacheBust = `?t=${Date.now()}`;
+  const healthRes = await fetch(ROUTES.music.health + cacheBust);
   const health = await healthRes.json();
   document.getElementById('esp32-status').textContent = healthRes.ok ? 'Online' : `Offline (${health.detail || healthRes.status})`;
   document.getElementById('esp32-count').textContent = health.tracks ?? '--';
   await refreshEsp32State();
 
-  const listRes = await fetch(ROUTES.music.list);
+  const listRes = await fetch(ROUTES.music.list + cacheBust);
   const listData = await listRes.json();
   const tracks = listRes.ok ? (listData.tracks || []) : [];
   if (!tracks.length) {
@@ -601,10 +575,14 @@ function setupMusicUpload() {
       return;
     }
 
-    status.textContent = `Uploaded ${data.filename}`;
+    status.textContent = `Uploaded ${data.filename} — refreshing catalog...`;
     input.value = '';
     label.textContent = 'Choose MP3...';
+    // Small delay to let Vercel Blob propagate before listing
+    await new Promise(r => setTimeout(r, 800));
     await refreshMusicCatalog();
+    status.textContent = `Uploaded ${data.filename}`;
+    status.className = 'success';
   });
 }
 
@@ -748,8 +726,6 @@ async function init() {
   document.getElementById('esp32-refresh').addEventListener('click', refreshMusicCatalog);
   setupMusicUpload();
   setupMusicUrlStream();
-  setupWifiManagement();
-
   await Promise.all([
     loadExpressions(),
     loadAnimationConfig(),
