@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from threading import Lock
 from typing import AsyncIterator
@@ -11,11 +12,18 @@ from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, field_validator
 
+from music import blob_store
+
+log = logging.getLogger(__name__)
+
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 if os.environ.get("VERCEL"):
     UPLOAD_DIR = "/tmp/uploads"
 else:
     UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+
+# Use Vercel Blob when the token is configured (serverless-safe persistent storage)
+USE_BLOB = blob_store.is_available()
 
 router = APIRouter(prefix="/music", tags=["music"])
 _command_lock = Lock()
@@ -141,6 +149,8 @@ def _safe_name(filename: str) -> str:
 
 
 def _list_mp3() -> list[str]:
+    if USE_BLOB:
+        return blob_store.list_mp3_names()
     if not os.path.isdir(UPLOAD_DIR):
         return []
     return sorted([f for f in os.listdir(UPLOAD_DIR) if f.lower().endswith(".mp3")])
@@ -215,12 +225,18 @@ def set_esp32_state(payload: Esp32StateUpdateRequest) -> JSONResponse:
 async def upload_music(file: UploadFile = File(...)) -> JSONResponse:
     if not file.filename or not file.filename.lower().endswith(".mp3"):
         raise HTTPException(status_code=400, detail="Only .mp3 files are accepted")
-    _ensure_upload_dir()
     safe_name = _safe_name(file.filename)
-    dest_path = os.path.join(UPLOAD_DIR, safe_name)
     content = await file.read()
-    with open(dest_path, "wb") as handle:
-        handle.write(content)
+
+    if USE_BLOB:
+        blob_store.upload(safe_name, content)
+        log.info("Uploaded to blob: %s (%d bytes)", safe_name, len(content))
+    else:
+        _ensure_upload_dir()
+        dest_path = os.path.join(UPLOAD_DIR, safe_name)
+        with open(dest_path, "wb") as handle:
+            handle.write(content)
+
     return JSONResponse({"status": "ok", "filename": safe_name, "bytes": len(content)})
 
 
@@ -246,8 +262,28 @@ def stream_url(url: str = Query(..., min_length=8)) -> StreamingResponse:
 
 @router.get("/{filename:path}")
 def serve_music(filename: str):
-    _ensure_upload_dir()
     safe_name = _safe_name(filename)
+
+    if USE_BLOB:
+        blob_url = blob_store.get_download_url(safe_name)
+        if not blob_url:
+            raise HTTPException(status_code=404, detail="File not found")
+        # Stream the file from Vercel Blob
+        try:
+            upstream = requests.get(blob_url, stream=True, timeout=15)
+            upstream.raise_for_status()
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=502, detail=f"Blob fetch failed: {exc}") from exc
+
+        def blob_iterator() -> AsyncIterator[bytes]:
+            for chunk in upstream.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+
+        return StreamingResponse(blob_iterator(), media_type="audio/mpeg",
+                                 headers={"Accept-Ranges": "bytes"})
+
+    _ensure_upload_dir()
     path = os.path.join(UPLOAD_DIR, safe_name)
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="File not found")
