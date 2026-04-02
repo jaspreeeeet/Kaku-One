@@ -19,13 +19,13 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI, HTTPException, UploadFile, File, Form, Request
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from engine.animator_runtime import animator
-from engine.expressions import EXPRESSIONS, invalidate_animation_cache
+from engine.expressions import DEFAULT_EXPRESSION, EXPRESSIONS, invalidate_animation_cache, load_animation_frames
 from config import HOST, PORT, ASSETS_DIR
 from music.local_music import router as local_music_router, _ensure_upload_dir
 
@@ -152,7 +152,37 @@ async def set_expression(req: ExpressionRequest):
 
 @app.get("/expression", summary="Get current expression")
 async def get_expression():
-    return {"expression": animator.current_expression}
+    expr_name = animator.current_expression
+    expr_def = EXPRESSIONS.get(expr_name, EXPRESSIONS[DEFAULT_EXPRESSION])
+    frames = load_animation_frames(expr_def["folder"])
+    return {
+        "expression": expr_name,
+        "frames": len(frames),
+        "loop": expr_def.get("loop", True),
+    }
+
+
+@app.get("/frame", summary="Single JPEG frame")
+async def get_single_frame(expression: str | None = None, index: int = 0):
+    """Return one JPEG frame. Stateless — works on Vercel serverless."""
+    expr_name = expression or animator.current_expression
+    if expr_name not in EXPRESSIONS:
+        expr_name = DEFAULT_EXPRESSION
+    expr_def = EXPRESSIONS[expr_name]
+    frames = load_animation_frames(expr_def["folder"])
+    if not frames:
+        raise HTTPException(status_code=404, detail=f"No frames for '{expr_name}'")
+    total = len(frames)
+    loop = expr_def.get("loop", True)
+    idx = index % total if loop else min(index, total - 1)
+    return Response(
+        content=frames[idx],
+        media_type="image/jpeg",
+        headers={
+            "X-Frame-Count": str(total),
+            "X-Loop": "1" if loop else "0",
+        },
+    )
 
 
 @app.get("/expressions", summary="List all expressions")
@@ -302,6 +332,11 @@ async def namespaced_set_expression(req: ExpressionRequest):
 @mimiclaw_router.get("/expressions")
 async def namespaced_list_expressions():
     return await list_expressions()
+
+
+@mimiclaw_router.get("/frame")
+async def namespaced_get_frame(expression: str | None = None, index: int = 0):
+    return await get_single_frame(expression, index)
 
 
 @mimiclaw_router.get("/api/status")
