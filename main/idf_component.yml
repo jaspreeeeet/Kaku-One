@@ -3,7 +3,7 @@ dependencies:
   ## Required IDF version
   idf:
     version: '>=5.5.0,<5.6.0'
-  espressif/esp_websocket_client: ^1.4.0
+  espressif/esp_websocket_client: ">=1.4.0,<1.6.0"
   ## AMOLED display driver (SH8601 / CO5300 QSPI panel)
   esp_lcd_sh8601:
     version: "*"

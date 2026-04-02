@@ -21,7 +21,7 @@
 
 static const char *TAG = "tool_expr";
 
-#define EXPRESSION_PATH  "/expression"
+#define EXPRESSION_PATH  "/mimiclaw/expression"
 #define HTTP_TIMEOUT_MS  5000
 #define RESP_BUF_SIZE    256
 

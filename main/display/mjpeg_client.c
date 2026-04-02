@@ -1,17 +1,17 @@
 /**
- * mjpeg_client.c — HTTP MJPEG stream client for MimiClaw.
+ * mjpeg_client.c — Frame-polling client for MimiClaw expression server.
  *
- * Connects to the expression server's GET /stream endpoint (multipart/x-mixed-replace).
- * Parses the MIME boundary, extracts each JPEG frame, and invokes the user callback.
+ * Instead of persistent MJPEG streaming (which fails on serverless platforms
+ * like Vercel), this fetches individual JPEG frames via HTTP GET requests.
  *
- * Wire format produced by the FastAPI server:
- *   --frame\r\n
- *   Content-Type: image/jpeg\r\n
- *   Content-Length: <N>\r\n
- *   \r\n
- *   <N bytes of JPEG data>
- *   \r\n
- *   (repeat)
+ * Flow:
+ *   1. GET /mimiclaw/expression → current expression name + frame count
+ *   2. GET /mimiclaw/frame?expression=X&index=N → single JPEG frame
+ *   3. Invoke frame callback (decode → display)
+ *   4. Delay to maintain target FPS, repeat
+ *
+ * A single esp_http_client with keep-alive reuses the TLS session across
+ * all requests to minimise handshake overhead.
  */
 
 #include "display/mjpeg_client.h"
@@ -23,8 +23,10 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -34,21 +36,27 @@ static const char *TAG = "mjpeg_client";
 
 #define NVS_NS                  "mimi_disp"
 #define NVS_KEY_SERVER_URL      "expr_srv_url"
-#define STREAM_PATH             "/stream"
 
-/* Read buffer for HTTP response body */
-#define READ_BUF_SIZE           (4 * 1024)
+/* Target frames per second */
+#define TARGET_FPS              12
+#define FRAME_DELAY_MS          (1000 / TARGET_FPS)
 
-/* Maximum JPEG frame size (80 KB — large enough for 466×466 quality 82) */
+/* Poll server for expression changes every N frames (~2 s) */
+#define EXPR_POLL_INTERVAL      (TARGET_FPS * 2)
+
+/* Maximum JPEG frame size (80 KB — 466×466 quality 82) */
 #define MAX_FRAME_SIZE          (80 * 1024)
 
-/* Reconnect delay on error */
+/* Buffer for small JSON responses */
+#define JSON_BUF_SIZE           512
+
+/* Delay after persistent errors before reconnecting */
 #define RECONNECT_DELAY_MS      3000
 
 /* Task config */
 #define MJPEG_TASK_STACK        (8 * 1024)
-#define MJPEG_TASK_PRIO         4
-#define MJPEG_TASK_CORE         0
+#define MJPEG_TASK_PRIO         2
+#define MJPEG_TASK_CORE         1
 
 
 /* ── state ───────────────────────────────────────────────────────────────── */
@@ -57,6 +65,13 @@ static char             s_server_url[256] = {0};
 static mjpeg_frame_cb_t s_frame_cb        = NULL;
 static TaskHandle_t     s_task_handle     = NULL;
 static volatile bool    s_running         = false;
+
+/* Animation state */
+static char    s_expression[32]  = "idle";
+static int     s_frame_count     = 145;
+static bool    s_loop            = true;
+static int     s_frame_index     = 0;
+
 
 /* ── NVS helpers ─────────────────────────────────────────────────────────── */
 
@@ -94,225 +109,192 @@ const char *mjpeg_client_get_server_url(void)
     return s_server_url;
 }
 
-/* ── MJPEG frame parser ───────────────────────────────────────────────────── */
 
-/**
- * Search for a byte pattern in a buffer.
- * Returns pointer to first occurrence, or NULL.
- */
-static const uint8_t *memmem_simple(const uint8_t *haystack, size_t hs_len,
-                                    const uint8_t *needle,   size_t nd_len)
+/* ── generic HTTP event handler — accumulates response into a buffer ───── */
+
+typedef struct {
+    uint8_t *buf;
+    size_t   len;
+    size_t   cap;
+} http_buf_t;
+
+static http_buf_t s_resp;                       /* shared, swapped before each request */
+
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
-    if (nd_len == 0 || nd_len > hs_len) return NULL;
-    for (size_t i = 0; i <= hs_len - nd_len; i++) {
-        if (memcmp(haystack + i, needle, nd_len) == 0) return haystack + i;
+    http_buf_t *r = (http_buf_t *)evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && r) {
+        size_t space = r->cap - r->len;
+        size_t n = (size_t)evt->data_len < space ? (size_t)evt->data_len : space;
+        if (n > 0) {
+            memcpy(r->buf + r->len, evt->data, n);
+            r->len += n;
+        }
     }
-    return NULL;
+    return ESP_OK;
 }
 
-/**
- * Extract the integer value of "Content-Length:" header from a header block.
- * header_block must be null-terminated.
- * Returns 0 if not found.
- */
-static int parse_content_length(const char *header_block)
-{
-    const char *p = strcasestr(header_block, "Content-Length:");
-    if (!p) return 0;
-    p += strlen("Content-Length:");
-    while (*p == ' ') p++;
-    return atoi(p);
-}
 
-/**
- * Core streaming loop — runs while s_running is true.
- * Opens the HTTP connection, reads the multipart stream, invokes frame callback.
- */
-static void mjpeg_stream_loop(void)
+/* ── poll expression state ─────────────────────────────────────────────── */
+
+static bool poll_expression(esp_http_client_handle_t client, char *json_buf)
 {
     char url[300];
-    snprintf(url, sizeof(url), "%s%s", s_server_url, STREAM_PATH);
+    snprintf(url, sizeof(url), "%s/mimiclaw/expression", s_server_url);
+    esp_http_client_set_url(client, url);
 
-    ESP_LOGI(TAG, "Connecting to MJPEG stream: %s", url);
+    /* Point shared buffer at the JSON scratch space */
+    s_resp.buf = (uint8_t *)json_buf;
+    s_resp.len = 0;
+    s_resp.cap = JSON_BUF_SIZE;
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+
+    if (err != ESP_OK || status != 200) {
+        ESP_LOGW(TAG, "Expression poll failed: err=%s status=%d",
+                 esp_err_to_name(err), status);
+        return false;
+    }
+
+    json_buf[s_resp.len < JSON_BUF_SIZE ? s_resp.len : JSON_BUF_SIZE - 1] = '\0';
+
+    cJSON *root = cJSON_Parse(json_buf);
+    if (!root) return false;
+
+    bool changed = false;
+
+    cJSON *j_expr   = cJSON_GetObjectItem(root, "expression");
+    cJSON *j_frames = cJSON_GetObjectItem(root, "frames");
+    cJSON *j_loop   = cJSON_GetObjectItem(root, "loop");
+
+    if (cJSON_IsString(j_expr) && j_expr->valuestring) {
+        if (strcmp(s_expression, j_expr->valuestring) != 0) {
+            strlcpy(s_expression, j_expr->valuestring, sizeof(s_expression));
+            s_frame_index = 0;
+            changed = true;
+            ESP_LOGI(TAG, "Expression → %s", s_expression);
+        }
+    }
+    if (cJSON_IsNumber(j_frames)) s_frame_count = j_frames->valueint;
+    if (cJSON_IsBool(j_loop))     s_loop = cJSON_IsTrue(j_loop);
+
+    cJSON_Delete(root);
+    return changed;
+}
+
+
+/* ── frame polling loop ────────────────────────────────────────────────── */
+
+static void frame_poll_loop(void)
+{
+    ESP_LOGI(TAG, "Frame polling start: %s  target %d FPS", s_server_url, TARGET_FPS);
+
+    /* Allocate frame buffer in PSRAM */
+    uint8_t *frame_buf = (uint8_t *)heap_caps_malloc(MAX_FRAME_SIZE,
+                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!frame_buf) frame_buf = (uint8_t *)malloc(MAX_FRAME_SIZE);
+    if (!frame_buf) {
+        ESP_LOGE(TAG, "Failed to allocate frame buffer");
+        return;
+    }
+
+    char json_buf[JSON_BUF_SIZE];
+
+    /* One HTTP client for all requests — keep-alive reuses TLS session */
+    char init_url[350];
+    snprintf(init_url, sizeof(init_url), "%s/mimiclaw/expression", s_server_url);
 
     esp_http_client_config_t cfg = {
-        .url            = url,
-        .timeout_ms     = 10000,
-        .buffer_size    = READ_BUF_SIZE,
+        .url               = init_url,
+        .timeout_ms        = 8000,
+        .buffer_size       = 4096,
+        .buffer_size_tx    = 1024,
         .keep_alive_enable = true,
         .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler     = http_event_handler,
+        .user_data         = &s_resp,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
-        ESP_LOGE(TAG, "Failed to create HTTP client");
+        ESP_LOGE(TAG, "HTTP client init failed");
+        heap_caps_free(frame_buf);
         return;
     }
 
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP open failed: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        return;
-    }
+    /* Initial expression poll */
+    poll_expression(client, json_buf);
 
-    int64_t content_len = esp_http_client_fetch_headers(client);
-    (void)content_len;  /* Streaming — no total content length */
-
-    int status = esp_http_client_get_status_code(client);
-    if (status != 200) {
-        ESP_LOGE(TAG, "HTTP status %d — expected 200", status);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return;
-    }
-
-    ESP_LOGI(TAG, "MJPEG stream connected (HTTP 200)");
-
-    /* Allocate read buffer (stack would be too large) */
-    uint8_t *read_buf = malloc(READ_BUF_SIZE);
-    /* Allocate frame accumulator in PSRAM if available */
-    uint8_t *frame_buf = (uint8_t *)heap_caps_malloc(MAX_FRAME_SIZE,
-                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!frame_buf) {
-        frame_buf = malloc(MAX_FRAME_SIZE);
-    }
-
-    if (!read_buf || !frame_buf) {
-        ESP_LOGE(TAG, "Failed to allocate buffers");
-        goto cleanup;
-    }
-
-    /* ── parser state machine ───────────────────────────────────────────── */
-    /*
-     * We maintain a "work buffer" of recently received bytes so we can detect
-     * the --frame boundary and header block even when they span multiple reads.
-     */
-    static const uint8_t BOUNDARY[]   = "--frame\r\n";
-    static const uint8_t HDR_END[]    = "\r\n\r\n";
-
-    /* Work buffer for header parsing (boundaries + sub-headers fit in 512 B) */
-    uint8_t  work[512];
-    size_t   work_len = 0;
-    bool     in_frame = false;    /* true: reading frame JPEG bytes */
-    int      frame_content_len = 0;
-    size_t   frame_bytes_read  = 0;
+    int poll_counter = 0;
+    int error_count  = 0;
 
     while (s_running) {
-        int rd = esp_http_client_read(client, (char *)read_buf, READ_BUF_SIZE);
-        if (rd < 0) {
-            ESP_LOGW(TAG, "Read error %d — reconnecting", rd);
-            break;
-        }
-        if (rd == 0) {
-            vTaskDelay(pdMS_TO_TICKS(5));
-            continue;
+        int64_t t0 = esp_timer_get_time();
+
+        /* ── periodically check expression ─────────────────────────── */
+        if (++poll_counter >= EXPR_POLL_INTERVAL) {
+            poll_expression(client, json_buf);
+            poll_counter = 0;
         }
 
-        size_t consumed = 0;
-        while (consumed < (size_t)rd) {
-            if (!in_frame) {
-                /* ── Looking for --frame\r\n + headers ─────────────────── */
-                /* Append incoming data to work buffer */
-                size_t to_copy = (size_t)rd - consumed;
-                if (work_len + to_copy > sizeof(work)) {
-                    to_copy = sizeof(work) - work_len;
-                }
-                memcpy(work + work_len, read_buf + consumed, to_copy);
-                work_len += to_copy;
-                consumed += to_copy;
+        /* ── fetch one JPEG frame ──────────────────────────────────── */
+        char frame_url[350];
+        snprintf(frame_url, sizeof(frame_url),
+                 "%s/mimiclaw/frame?expression=%s&index=%d",
+                 s_server_url, s_expression, s_frame_index);
+        esp_http_client_set_url(client, frame_url);
 
-                /* Find boundary */
-                const uint8_t *boundary_pos = memmem_simple(work, work_len,
-                                                              BOUNDARY, sizeof(BOUNDARY) - 1);
-                if (!boundary_pos) {
-                    /* Keep last (sizeof(BOUNDARY)-1) bytes in case boundary spans reads */
-                    size_t keep = sizeof(BOUNDARY) - 1;
-                    if (work_len > keep) {
-                        memmove(work, work + work_len - keep, keep);
-                        work_len = keep;
-                    }
-                    continue;
-                }
+        s_resp.buf = frame_buf;
+        s_resp.len = 0;
+        s_resp.cap = MAX_FRAME_SIZE;
 
-                /* Found boundary — advance past it */
-                size_t after_boundary = (boundary_pos - work) + sizeof(BOUNDARY) - 1;
+        esp_err_t err = esp_http_client_perform(client);
+        int status = esp_http_client_get_status_code(client);
 
-                /* Find end of sub-headers (\r\n\r\n) */
-                const uint8_t *hdr_end = memmem_simple(work + after_boundary,
-                                                        work_len - after_boundary,
-                                                        HDR_END, sizeof(HDR_END) - 1);
-                if (!hdr_end) {
-                    /* Headers not fully received yet — keep work buffer */
-                    if (after_boundary > 0) {
-                        memmove(work, work + after_boundary, work_len - after_boundary);
-                        work_len -= after_boundary;
-                    }
-                    continue;
-                }
+        if (err == ESP_OK && status == 200 && s_resp.len > 0) {
+            error_count = 0;
 
-                /* Null-terminate the header block for string parsing */
-                size_t hdr_len = (hdr_end - (work + after_boundary));
-                char hdr_block[256] = {0};
-                if (hdr_len < sizeof(hdr_block)) {
-                    memcpy(hdr_block, work + after_boundary, hdr_len);
-                }
+            /* Deliver frame */
+            if (s_frame_cb) {
+                s_frame_cb(frame_buf, s_resp.len);
+            }
 
-                frame_content_len = parse_content_length(hdr_block);
-                if (frame_content_len <= 0 || frame_content_len > MAX_FRAME_SIZE) {
-                    ESP_LOGW(TAG, "Bad Content-Length: %d — skipping", frame_content_len);
-                    /* Discard work buffer and continue searching */
-                    work_len = 0;
-                    continue;
-                }
-
-                /* Data after \r\n\r\n is the start of the JPEG frame */
-                size_t data_start = (hdr_end - work) + sizeof(HDR_END) - 1;
-                size_t leftover   = work_len - data_start;
-
-                frame_bytes_read = 0;
-                if (leftover > 0) {
-                    size_t copy = leftover < (size_t)frame_content_len ? leftover : (size_t)frame_content_len;
-                    memcpy(frame_buf, work + data_start, copy);
-                    frame_bytes_read = copy;
-                }
-
-                work_len = 0;
-                in_frame = true;
-
+            /* Advance index */
+            s_frame_index++;
+            if (s_loop) {
+                if (s_frame_count > 0) s_frame_index %= s_frame_count;
             } else {
-                /* ── Accumulating JPEG frame bytes ────────────────────── */
-                size_t need = (size_t)frame_content_len - frame_bytes_read;
-                size_t avail = (size_t)rd - consumed;
-                size_t copy  = avail < need ? avail : need;
+                if (s_frame_count > 0 && s_frame_index >= s_frame_count)
+                    s_frame_index = s_frame_count - 1;
+            }
 
-                if (frame_bytes_read + copy <= MAX_FRAME_SIZE) {
-                    memcpy(frame_buf + frame_bytes_read, read_buf + consumed, copy);
-                }
-                frame_bytes_read += copy;
-                consumed         += copy;
+            /* Maintain target FPS */
+            int64_t elapsed_us = esp_timer_get_time() - t0;
+            int delay = FRAME_DELAY_MS - (int)(elapsed_us / 1000);
+            vTaskDelay(pdMS_TO_TICKS(delay > 1 ? delay : 1));
 
-                if (frame_bytes_read >= (size_t)frame_content_len) {
-                    /* Full JPEG frame received — invoke callback */
-                    if (s_frame_cb) {
-                        s_frame_cb(frame_buf, (size_t)frame_content_len);
-                    }
-                    in_frame = false;
-                    frame_bytes_read  = 0;
-                    frame_content_len = 0;
-                }
+        } else {
+            ESP_LOGW(TAG, "Frame fetch failed: err=%s status=%d len=%d",
+                     esp_err_to_name(err), status, (int)s_resp.len);
+            error_count++;
+
+            /* Exponential back-off (1 s → 5 s max) */
+            int backoff = error_count * 1000;
+            if (backoff > 5000) backoff = 5000;
+            vTaskDelay(pdMS_TO_TICKS(backoff));
+
+            if (error_count >= 10) {
+                ESP_LOGW(TAG, "Too many errors — will reconnect");
+                break;
             }
         }
     }
 
-cleanup:
-    free(read_buf);
-    if (frame_buf) {
-        heap_caps_free(frame_buf);  /* safe even if allocated with malloc */
-    }
-    esp_http_client_close(client);
     esp_http_client_cleanup(client);
+    heap_caps_free(frame_buf);
 }
+
 
 /* ── FreeRTOS task ───────────────────────────────────────────────────────── */
 
@@ -320,12 +302,12 @@ static void mjpeg_task(void *arg)
 {
     while (s_running) {
         if (strlen(s_server_url) == 0) {
-            ESP_LOGW(TAG, "No server URL configured. Use: set_display_server <url>");
+            ESP_LOGW(TAG, "No server URL configured");
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
 
-        mjpeg_stream_loop();
+        frame_poll_loop();
 
         if (s_running) {
             ESP_LOGI(TAG, "Reconnecting in %d ms…", RECONNECT_DELAY_MS);
@@ -337,6 +319,7 @@ static void mjpeg_task(void *arg)
     s_task_handle = NULL;
     vTaskDelete(NULL);
 }
+
 
 /* ── public API ──────────────────────────────────────────────────────────── */
 
@@ -350,7 +333,7 @@ esp_err_t mjpeg_client_init(mjpeg_frame_cb_t frame_cb)
     /* Override with NVS value if present */
     load_server_url_from_nvs();
 
-    ESP_LOGI(TAG, "MJPEG client init — server: %s",
+    ESP_LOGI(TAG, "Frame-poll client init — server: %s",
              strlen(s_server_url) ? s_server_url : "(not configured)");
     return ESP_OK;
 }
@@ -368,11 +351,11 @@ void mjpeg_client_start(void)
         MJPEG_TASK_PRIO, &s_task_handle,
         MJPEG_TASK_CORE
     );
-    ESP_LOGI(TAG, "MJPEG client task started");
+    ESP_LOGI(TAG, "Frame-poll client task started");
 }
 
 void mjpeg_client_stop(void)
 {
     s_running = false;
-    ESP_LOGI(TAG, "MJPEG client stop requested");
+    ESP_LOGI(TAG, "Frame-poll client stop requested");
 }
