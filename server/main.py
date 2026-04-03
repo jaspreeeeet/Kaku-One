@@ -18,7 +18,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import APIRouter, FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi import APIRouter, FastAPI, HTTPException, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -28,6 +28,7 @@ from engine.animator_runtime import animator
 from engine.expressions import DEFAULT_EXPRESSION, EXPRESSIONS, invalidate_animation_cache, load_animation_frames
 from config import HOST, PORT, ASSETS_DIR
 from music.local_music import router as local_music_router, _ensure_upload_dir
+from ws_manager import manager as ws_manager, set_event_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ MJPEG_BOUNDARY = "frame"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    set_event_loop(asyncio.get_running_loop())
     _ensure_upload_dir()
     log.info("Registered routes: %s", sorted(route.path for route in app.routes))
     if not os.environ.get("VERCEL"):
@@ -278,6 +280,77 @@ async def debug_routes():
     return {
         "routes": sorted(route.path for route in app.routes),
     }
+
+
+# ── WebSocket endpoints ───────────────────────────────────────────────────────
+
+@app.websocket("/ws/esp32")
+async def ws_esp32(websocket: WebSocket):
+    """WebSocket for ESP32 devices — replaces command polling and state POST."""
+    from music.local_music import (
+        _latest_command, _latest_state, _command_lock, _state_lock,
+        _update_state, _command_version, _list_mp3,
+    )
+    await ws_manager.connect_esp32(websocket)
+    try:
+        with _command_lock:
+            cmd = dict(_latest_command)
+        with _state_lock:
+            state = dict(_latest_state)
+        tracks = _list_mp3()
+        await websocket.send_json({"type": "command", **cmd})
+        await websocket.send_json({"type": "state", **state})
+        await websocket.send_json({"type": "tracks", "tracks": tracks})
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
+            if msg_type == "state":
+                _update_state(
+                    state=data.get("state", "stopped"),
+                    file=data.get("file", ""),
+                    source=data.get("source", ""),
+                    device_ip=data.get("device_ip", ""),
+                    version=_command_version,
+                )
+                await ws_manager.broadcast_to_dashboards({"type": "state", **data})
+    except (WebSocketDisconnect, Exception):
+        await ws_manager.disconnect_esp32(websocket)
+
+
+@app.websocket("/ws/dashboard")
+async def ws_dashboard(websocket: WebSocket):
+    """WebSocket for dashboard clients — replaces state/command polling."""
+    from music.local_music import (
+        _latest_command, _latest_state, _command_lock, _state_lock,
+        _set_command, _list_mp3, _validate_remote_url,
+    )
+    await ws_manager.connect_dashboard(websocket)
+    try:
+        with _command_lock:
+            cmd = dict(_latest_command)
+        with _state_lock:
+            state = dict(_latest_state)
+        tracks = _list_mp3()
+        await websocket.send_json({"type": "command", **cmd})
+        await websocket.send_json({"type": "state", **state})
+        await websocket.send_json({"type": "tracks", "tracks": tracks})
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
+            if msg_type == "command":
+                action = data.get("action", "")
+                file = data.get("file", "")
+                source_url = data.get("source_url", "")
+                stream_url = data.get("stream_url", "")
+                if action == "play_url" and source_url:
+                    source_url = _validate_remote_url(source_url)
+                    stream_url = f"/music/stream?url={source_url}"
+                cmd = _set_command(action, file=file, source_url=source_url,
+                                   stream_url=stream_url)
+                await ws_manager.broadcast_to_esp32({"type": "command", **cmd})
+                await ws_manager.broadcast_to_dashboards({"type": "command", **cmd})
+    except (WebSocketDisconnect, Exception):
+        await ws_manager.disconnect_dashboard(websocket)
 
 
 # ── dashboard ──────────────────────────────────────────────────────────────────

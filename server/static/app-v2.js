@@ -23,6 +23,65 @@ const ROUTES = {
     },
 };
 
+// ── WebSocket connection (replaces polling for esp32 command/state) ────────
+const WS_URL = API_BASE.replace(/^http/, 'ws') + '/ws/dashboard';
+let _ws = null;
+let _wsConnected = false;
+let _wsReconnectTimer = null;
+
+function connectWebSocket() {
+  if (_ws && (_ws.readyState === WebSocket.CONNECTING || _ws.readyState === WebSocket.OPEN)) {
+    return;
+  }
+  try {
+    _ws = new WebSocket(WS_URL);
+  } catch {
+    return;
+  }
+
+  _ws.onopen = () => {
+    _wsConnected = true;
+    console.log('[WS] connected');
+  };
+
+  _ws.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'state') {
+        currentEsp32State = msg;
+        updateEsp32PlaybackMeta();
+        renderTrackList(currentTracks);
+      } else if (msg.type === 'command') {
+        // command acknowledgement — refresh UI
+        renderTrackList(currentTracks);
+      } else if (msg.type === 'tracks') {
+        currentTracks = msg.tracks || [];
+        renderTrackList(currentTracks);
+      }
+    } catch { /* ignore malformed */ }
+  };
+
+  _ws.onclose = () => {
+    _wsConnected = false;
+    _ws = null;
+    console.log('[WS] disconnected, reconnecting in 3s');
+    clearTimeout(_wsReconnectTimer);
+    _wsReconnectTimer = setTimeout(connectWebSocket, 3000);
+  };
+
+  _ws.onerror = () => {
+    // onclose will fire after onerror
+  };
+}
+
+function wsSendCommand(action, extra = {}) {
+  if (_wsConnected && _ws && _ws.readyState === WebSocket.OPEN) {
+    _ws.send(JSON.stringify({ type: 'command', action, ...extra }));
+    return true;
+  }
+  return false;
+}
+
 const EXPRESSION_LABELS = {
   idle: 'Idle',
   happy: 'Happy',
@@ -280,6 +339,9 @@ function renderTrackList(tracks) {
 }
 
 async function sendEsp32FileCommand(action, file) {
+  if (wsSendCommand(action, { file })) {
+    return { status: 'ok' };
+  }
   const response = await fetch(ROUTES.music.esp32Command, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -295,6 +357,9 @@ async function sendEsp32FileCommand(action, file) {
 }
 
 async function sendEsp32Command(action, extra = {}) {
+  if (wsSendCommand(action, extra)) {
+    return { status: 'ok' };
+  }
   const response = await fetch(ROUTES.music.esp32Command, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -601,6 +666,15 @@ function setupMusicUrlStream() {
     }
     status.textContent = 'Sending stream command to ESP32...';
 
+    if (wsSendCommand('play_url', { source_url: url })) {
+      status.textContent = 'ESP32 will start the remote stream.';
+      status.className = 'success';
+      const streamUrl = `${ROUTES.music.stream}?url=${encodeURIComponent(url)}`;
+      player.src = streamUrl;
+      player.play().catch(() => {});
+      return;
+    }
+
     const response = await fetch(`${API_BASE}/music/esp32/play-url`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -735,9 +809,11 @@ async function init() {
 
   setInterval(pollStatus, 2000);
   setInterval(async () => {
+    if (_wsConnected) return; // skip polling when WebSocket is active
     await refreshEsp32State();
     renderTrackList(currentTracks);
   }, 2000);
+  connectWebSocket();
 }
 
 document.addEventListener('DOMContentLoaded', init);

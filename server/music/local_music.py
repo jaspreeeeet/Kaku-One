@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, field_validator
 
 from music import blob_store
+from ws_manager import notify_sync
 
 log = logging.getLogger(__name__)
 
@@ -186,6 +187,7 @@ def set_esp32_command(payload: Esp32CommandRequest) -> JSONResponse:
     if payload.action == "play" and not payload.file:
         raise HTTPException(status_code=400, detail="File is required for play action")
     command = _set_command(payload.action, file=payload.file)
+    notify_sync({"type": "command", **command}, target="esp32")
     return JSONResponse({"status": "ok", **command})
 
 
@@ -194,12 +196,14 @@ def set_esp32_play_url(payload: Esp32PlayUrlRequest) -> JSONResponse:
     source_url = _validate_remote_url(payload.url.strip())
     stream_url = f"/music/stream?url={source_url}"
     command = _set_command("play_url", source_url=source_url, stream_url=stream_url)
+    notify_sync({"type": "command", **command}, target="esp32")
     return JSONResponse({"status": "ok", **command})
 
 
 @router.post("/esp32/stop")
 def stop_esp32_stream() -> JSONResponse:
     command = _set_command("stop")
+    notify_sync({"type": "command", **command}, target="esp32")
     return JSONResponse({"status": "ok", **command})
 
 
@@ -218,6 +222,7 @@ def set_esp32_state(payload: Esp32StateUpdateRequest) -> JSONResponse:
         device_ip=payload.device_ip,
         version=_command_version,
     )
+    notify_sync({"type": "state", **state}, target="dashboard")
     return JSONResponse({"status": "ok", **state})
 
 
@@ -237,6 +242,7 @@ async def upload_music(file: UploadFile = File(...)) -> JSONResponse:
         with open(dest_path, "wb") as handle:
             handle.write(content)
 
+    notify_sync({"type": "tracks", "tracks": _list_mp3()}, target="all")
     return JSONResponse({"status": "ok", "filename": safe_name, "bytes": len(content)})
 
 
